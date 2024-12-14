@@ -1,0 +1,22 @@
+syntax = "proto3";
+package proto;
+option go_package = "./proto";
+
+message Operation {
+    string operation_id = 1;
+    int64 timestamp = 2;
+    string replica_id = 3;
+    string command = 4;
+    repeated string args = 5;
+    OperationType type = 6;
+}
+
+enum OperationType {
+    SET = 0;
+    DELETE = 1;
+    // Add more operation types as needed
+}
+
+message OperationBatch {
+    repeated Operation operations = 1;
+}
