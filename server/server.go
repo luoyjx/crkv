@@ -3,6 +3,7 @@ package server
 import (
 	"fmt"
 	"log"
+	"strconv"
 	"sync"
 	"time"
 
@@ -107,7 +108,8 @@ func (s *Server) applyOperation(op *proto.Operation) error {
 			return fmt.Errorf("invalid SET operation args: expected 2, got %d", len(op.Args))
 		}
 		key, value := op.Args[0], op.Args[1]
-		return s.store.Set(key, value, op.Timestamp, op.ReplicaId, nil)
+		val := storage.NewStringValue(value, op.Timestamp, op.ReplicaId)
+		return s.store.Set(key, val, nil)
 	default:
 		return fmt.Errorf("unknown operation type: %v", op.Type)
 	}
@@ -115,26 +117,86 @@ func (s *Server) applyOperation(op *proto.Operation) error {
 
 // Set implements the SET command
 func (s *Server) Set(key, value string) error {
-	// Create operation
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	timestamp := time.Now().UnixNano()
+	val := storage.NewStringValue(value, timestamp, "server1") // TODO: Make replicaID configurable
+
+	if err := s.store.Set(key, val, nil); err != nil {
+		return fmt.Errorf("failed to set value: %v", err)
+	}
+
+	// Log the operation
 	op := &proto.Operation{
-		Type:      proto.OperationType_SET,
-		Args:      []string{key, value},
-		Timestamp: time.Now().UnixNano(),
-		ReplicaId: operation.GetReplicaID(),
+		OperationId: fmt.Sprintf("%d-%s", timestamp, key),
+		Type:       proto.OperationType_SET,
+		Command:    "SET",
+		Args:       []string{key, value},
+		Timestamp:  timestamp,
 	}
-
-	// Add to operation log first
 	if err := s.opLog.AddOperation(op); err != nil {
-		return fmt.Errorf("failed to add operation to log: %v", err)
+		return fmt.Errorf("failed to log operation: %v", err)
 	}
 
-	// Then apply it
-	return s.applyOperation(op)
+	return nil
 }
 
 // Get implements the GET command
 func (s *Server) Get(key string) (string, bool) {
-	return s.store.Get(key)
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+
+	value, exists := s.store.Get(key)
+	if !exists {
+		return "", false
+	}
+
+	return value.String(), true
+}
+
+// Incr implements the INCR command
+func (s *Server) Incr(key string) (int64, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	timestamp := time.Now().UnixNano()
+	value, exists := s.store.Get(key)
+	
+	var counter int64
+	if exists {
+		if value.Type != storage.TypeCounter {
+			// Convert existing string to counter if possible
+			if i, err := strconv.ParseInt(value.String(), 10, 64); err == nil {
+				counter = i
+			} else {
+				return 0, fmt.Errorf("value is not an integer")
+			}
+		} else {
+			counter = value.Counter()
+		}
+	}
+	
+	counter++
+	val := storage.NewCounterValue(counter, timestamp, "server1") // TODO: Make replicaID configurable
+
+	if err := s.store.Set(key, val, nil); err != nil {
+		return 0, fmt.Errorf("failed to set counter: %v", err)
+	}
+
+	// Log the operation
+	op := &proto.Operation{
+		OperationId: fmt.Sprintf("%d-%s", timestamp, key),
+		Type:       proto.OperationType_INCR,
+		Command:    "INCR",
+		Args:       []string{key, strconv.FormatInt(counter, 10)},
+		Timestamp:  timestamp,
+	}
+	if err := s.opLog.AddOperation(op); err != nil {
+		return 0, fmt.Errorf("failed to log operation: %v", err)
+	}
+
+	return counter, nil
 }
 
 // Close closes the server and its resources

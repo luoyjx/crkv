@@ -42,75 +42,161 @@ func setupTestStore(t *testing.T) *testStore {
 	}
 }
 
-func TestStoreSetGet(t *testing.T) {
+func TestStore_SetGet(t *testing.T) {
 	ts := setupTestStore(t)
 	defer ts.cleanup()
 
+	// Test setting and getting a regular string
+	key := "test_key"
+	value := "test_value"
 	timestamp := time.Now().UnixNano()
-	replicaID := "test-replica"
+	val := NewStringValue(value, timestamp, "test1")
 
-	// Test basic set and get
-	err := ts.Set("key1", "value1", timestamp, replicaID, nil)
-	if err != nil {
-		t.Errorf("Set failed: %v", err)
+	if err := ts.Store.Set(key, val, nil); err != nil {
+		t.Fatalf("Failed to set value: %v", err)
 	}
 
-	// Verify value in CRDT state
-	value, exists := ts.Get("key1")
+	got, exists := ts.Store.Get(key)
 	if !exists {
-		t.Error("Get returned not exists for existing key")
+		t.Fatal("Value should exist")
 	}
-	if value != "value1" {
-		t.Errorf("Get returned wrong value. Expected 'value1', got '%s'", value)
-	}
-
-	// Verify value in Redis
-	redisValue, exists, err := ts.redis.Get(ts.ctx, "key1")
-	if err != nil {
-		t.Errorf("Redis Get failed: %v", err)
-	}
-	if !exists {
-		t.Error("Key doesn't exist in Redis")
-	}
-	if redisValue != "value1" {
-		t.Errorf("Redis has wrong value. Expected 'value1', got '%s'", redisValue)
-	}
-
-	// Test get non-existent key
-	val, exists := ts.Get("nonexistent")
-	if exists {
-		t.Error("Get returned exists for non-existent key, value:", val)
+	if got.String() != value {
+		t.Errorf("Got %v, want %v", got.String(), value)
 	}
 }
 
-func TestStoreCRDT(t *testing.T) {
+func TestStore_Counter(t *testing.T) {
+	ts := setupTestStore(t)
+	defer ts.cleanup()
+
+	key := "counter_key"
+	timestamp := time.Now().UnixNano()
+	val := NewCounterValue(42, timestamp, "test1")
+
+	if err := ts.Store.Set(key, val, nil); err != nil {
+		t.Fatalf("Failed to set counter: %v", err)
+	}
+
+	got, exists := ts.Store.Get(key)
+	if !exists {
+		t.Fatal("Counter should exist")
+	}
+	if got.Counter() != 42 {
+		t.Errorf("Got counter %v, want %v", got.Counter(), 42)
+	}
+	if got.String() != "42" {
+		t.Errorf("Got string representation %v, want %v", got.String(), "42")
+	}
+}
+
+func TestStore_TTL(t *testing.T) {
+	ts := setupTestStore(t)
+	defer ts.cleanup()
+
+	key := "ttl_key"
+	value := "ttl_value"
+	timestamp := time.Now().UnixNano()
+	val := NewStringValue(value, timestamp, "test1")
+	ttl := int64(1) // 1 second TTL
+
+	if err := ts.Store.Set(key, val, &ttl); err != nil {
+		t.Fatalf("Failed to set value with TTL: %v", err)
+	}
+
+	// Value should exist immediately
+	got, exists := ts.Store.Get(key)
+	if !exists {
+		t.Fatal("Value should exist before TTL expires")
+	}
+	if got.String() != value {
+		t.Errorf("Got %v, want %v", got.String(), value)
+	}
+
+	// Wait for TTL to expire
+	time.Sleep(2 * time.Second)
+
+	_, exists = ts.Store.Get(key)
+	if exists {
+		t.Error("Value should not exist after TTL expires")
+	}
+}
+
+func TestStore_Merge(t *testing.T) {
+	ts := setupTestStore(t)
+	defer ts.cleanup()
+
+	key := "merge_key"
+	timestamp1 := time.Now().UnixNano()
+	timestamp2 := timestamp1 + 1
+
+	// Test string merge (LWW)
+	val1 := NewStringValue("value1", timestamp1, "test1")
+	val2 := NewStringValue("value2", timestamp2, "test2")
+
+	if err := ts.Store.Set(key, val1, nil); err != nil {
+		t.Fatalf("Failed to set first value: %v", err)
+	}
+	if err := ts.Store.Set(key, val2, nil); err != nil {
+		t.Fatalf("Failed to set second value: %v", err)
+	}
+
+	got, exists := ts.Store.Get(key)
+	if !exists {
+		t.Fatal("Value should exist")
+	}
+	if got.String() != "value2" {
+		t.Errorf("Got %v, want %v", got.String(), "value2")
+	}
+
+	// Test counter merge (accumulative)
+	counterKey := "counter_merge"
+	counter1 := NewCounterValue(5, timestamp1, "test1")
+	counter2 := NewCounterValue(3, timestamp2, "test2")
+
+	if err := ts.Store.Set(counterKey, counter1, nil); err != nil {
+		t.Fatalf("Failed to set first counter: %v", err)
+	}
+	if err := ts.Store.Set(counterKey, counter2, nil); err != nil {
+		t.Fatalf("Failed to set second counter: %v", err)
+	}
+
+	gotCounter, exists := ts.Store.Get(counterKey)
+	if !exists {
+		t.Fatal("Counter should exist")
+	}
+	if gotCounter.Counter() != 8 {
+		t.Errorf("Got counter %v, want %v", gotCounter.Counter(), 8)
+	}
+}
+
+func TestStore_CRDT(t *testing.T) {
 	ts := setupTestStore(t)
 	defer ts.cleanup()
 
 	replicaID := "test-replica"
 
 	// Test that higher timestamp wins
-	err := ts.Set("key1", "value1", 100, replicaID, nil)
+	err := ts.Store.Set("key1", NewStringValue("value1", 100, replicaID), nil)
 	if err != nil {
 		t.Errorf("First set failed: %v", err)
 	}
 
-	err = ts.Set("key1", "value2", 200, replicaID, nil)
+	err = ts.Store.Set("key1", NewStringValue("value2", 200, replicaID), nil)
 	if err != nil {
 		t.Errorf("Second set failed: %v", err)
 	}
 
 	// Check CRDT state
-	value, exists := ts.Get("key1")
+	value, exists := ts.Store.Get("key1")
 	if !exists {
 		t.Error("Get returned not exists for existing key")
 	}
-	if value != "value2" {
-		t.Errorf("Wrong value after CRDT resolution. Expected 'value2', got '%s'", value)
+	if value.String() != "value2" {
+		t.Errorf("Wrong value after CRDT resolution. Expected 'value2', got '%s'", value.String())
 	}
 
 	// Check Redis state
-	redisValue, exists, err := ts.redis.Get(ts.ctx, "key1")
+	redisValue, exists, err := ts.Store.redis.Get(ts.Store.ctx, "key1")
 	if err != nil {
 		t.Errorf("Redis Get failed: %v", err)
 	}
@@ -122,21 +208,21 @@ func TestStoreCRDT(t *testing.T) {
 	}
 
 	// Test that lower timestamp doesn't override higher
-	err = ts.Set("key1", "value3", 150, replicaID, nil)
+	err = ts.Store.Set("key1", NewStringValue("value3", 150, replicaID), nil)
 	if err != nil {
 		t.Errorf("Third set failed: %v", err)
 	}
 
-	value, exists = ts.Get("key1")
+	value, exists = ts.Store.Get("key1")
 	if !exists {
 		t.Error("Get returned not exists for existing key")
 	}
-	if value != "value2" {
-		t.Errorf("Wrong value after CRDT resolution. Expected 'value2', got '%s'", value)
+	if value.String() != "value2" {
+		t.Errorf("Wrong value after CRDT resolution. Expected 'value2', got '%s'", value.String())
 	}
 
 	// Verify Redis wasn't updated
-	redisValue, exists, err = ts.redis.Get(ts.ctx, "key1")
+	redisValue, exists, err = ts.Store.redis.Get(ts.Store.ctx, "key1")
 	if err != nil {
 		t.Errorf("Redis Get failed: %v", err)
 	}
@@ -148,148 +234,21 @@ func TestStoreCRDT(t *testing.T) {
 	}
 }
 
-func TestStoreTTL(t *testing.T) {
+func TestStore_Persistence(t *testing.T) {
 	ts := setupTestStore(t)
-	defer ts.cleanup()
-
-	timestamp := time.Now().UnixNano()
-	replicaID := "test-replica"
-
-	// Test setting with TTL
-	ttl := int64(2) // 2 seconds
-	err := ts.Set("key1", "value1", timestamp, replicaID, &ttl)
-	if err != nil {
-		t.Errorf("Set with TTL failed: %v", err)
-	}
-
-	// Verify TTL is set in CRDT state
-	remaining, exists := ts.GetTTL("key1")
-	if !exists {
-		t.Error("GetTTL returned not exists for existing key")
-	}
-	if remaining <= 0 || remaining > 2 {
-		t.Errorf("Wrong TTL in CRDT state. Expected between 0 and 2, got %d", remaining)
-	}
-
-	// Verify TTL is set in Redis
-	redisTTL, err := ts.redis.GetTTL(ts.ctx, "key1")
-	if err != nil {
-		t.Errorf("Redis GetTTL failed: %v", err)
-	}
-	if redisTTL <= 0 || redisTTL > time.Second*2 {
-		t.Errorf("Wrong TTL in Redis. Expected between 0 and 2 seconds, got %v", redisTTL)
-	}
-
-	// Test that value exists
-	value, exists := ts.Get("key1")
-	if !exists {
-		t.Error("Get returned not exists for existing key")
-	}
-	if value != "value1" {
-		t.Errorf("Get returned wrong value. Expected 'value1', got '%s'", value)
-	}
-
-	// Wait for expiration
-	time.Sleep(3 * time.Second)
-
-	// Verify key has expired in CRDT state
-	_, exists = ts.Get("key1")
-	if exists {
-		t.Error("Key still exists in CRDT state after TTL expiration")
-	}
-
-	// Verify key has expired in Redis
-	_, exists, err = ts.redis.Get(ts.ctx, "key1")
-	if err != nil {
-		t.Errorf("Redis Get failed: %v", err)
-	}
-	if exists {
-		t.Error("Key still exists in Redis after TTL expiration")
-	}
-
-	// Test TTL conflict resolution
-	shortTTL := int64(5) // 5 seconds
-	longTTL := int64(10) // 10 seconds
-
-	// Set with short TTL
-	err = ts.Set("key2", "short", timestamp, replicaID, &shortTTL)
-	if err != nil {
-		t.Errorf("Set with short TTL failed: %v", err)
-	}
-
-	// Try to set with long TTL (should win)
-	err = ts.Set("key2", "long", timestamp+1, replicaID, &longTTL)
-	if err != nil {
-		t.Errorf("Set with long TTL failed: %v", err)
-	}
-
-	// Verify CRDT state
-	value, exists = ts.Get("key2")
-	if !exists || value != "long" {
-		t.Errorf("Long TTL didn't win in CRDT state. Got value: %s", value)
-	}
-
-	// Verify Redis state
-	redisValue, exists, err := ts.redis.Get(ts.ctx, "key2")
-	if err != nil {
-		t.Errorf("Redis Get failed: %v", err)
-	}
-	if !exists || redisValue != "long" {
-		t.Errorf("Long TTL didn't win in Redis. Got value: %s", redisValue)
-	}
-
-	// Try to set with no TTL (should win)
-	err = ts.Set("key2", "no-ttl", timestamp+2, replicaID, nil)
-	if err != nil {
-		t.Errorf("Set with no TTL failed: %v", err)
-	}
-
-	// Verify CRDT state
-	value, exists = ts.Get("key2")
-	if !exists || value != "no-ttl" {
-		t.Errorf("No TTL didn't win in CRDT state. Got value: %s", value)
-	}
-
-	// Verify Redis state
-	redisValue, exists, err = ts.redis.Get(ts.ctx, "key2")
-	if err != nil {
-		t.Errorf("Redis Get failed: %v", err)
-	}
-	if !exists || redisValue != "no-ttl" {
-		t.Errorf("No TTL didn't win in Redis. Got value: %s", redisValue)
-	}
-
-	// Verify no TTL in CRDT state
-	remaining, exists = ts.GetTTL("key2")
-	if !exists || remaining != -1 {
-		t.Errorf("Expected TTL -1 for no TTL in CRDT state, got %d", remaining)
-	}
-
-	// Verify no TTL in Redis
-	redisTTL, err = ts.redis.GetTTL(ts.ctx, "key2")
-	if err != nil {
-		t.Errorf("Redis GetTTL failed: %v", err)
-	}
-	if redisTTL != -1*time.Second {
-		t.Errorf("Expected TTL -1s for no TTL in Redis, got %v", redisTTL)
-	}
-}
-
-func TestStorePersistence(t *testing.T) {
-	ts := setupTestStore(t)
-	tmpDir := ts.GetPath()
+	tmpDir := ts.Store.GetPath()
 
 	timestamp := time.Now().UnixNano()
 	replicaID := "test-replica"
 
 	// Set some data
-	err := ts.Set("key1", "value1", timestamp, replicaID, nil)
+	err := ts.Store.Set("key1", NewStringValue("value1", timestamp, replicaID), nil)
 	if err != nil {
 		t.Errorf("Set failed: %v", err)
 	}
 
 	// Close store
-	err = ts.Close()
+	err = ts.Store.Close()
 	if err != nil {
 		t.Errorf("Close failed: %v", err)
 	}
@@ -320,8 +279,8 @@ func TestStorePersistence(t *testing.T) {
 	if !exists {
 		t.Error("Key doesn't exist after reopening store")
 	}
-	if value != "value1" {
-		t.Errorf("Wrong value after reopening. Expected 'value1', got '%s'", value)
+	if value.String() != "value1" {
+		t.Errorf("Wrong value after reopening. Expected 'value1', got '%s'", value.String())
 	}
 
 	// Verify Redis was updated

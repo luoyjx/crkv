@@ -8,17 +8,124 @@ import (
 	"log"
 	"os"
 	"path/filepath"
+	"strconv"
 	"sync"
 	"time"
+
+	"encoding/binary"
+)
+
+// ValueType represents the type of value stored
+type ValueType int
+
+const (
+	TypeString  ValueType = iota // Regular string with LWW
+	TypeCounter                  // String counter with accumulative semantics
 )
 
 // Value represents a stored value with CRDT metadata
 type Value struct {
-	Value     string    `json:"value"`
-	Timestamp int64     `json:"timestamp"`
+	Type      ValueType `json:"type"`      // Type of the value (string or counter)
+	Data      []byte    `json:"data"`      // Raw bytes of the value
+	Timestamp int64     `json:"timestamp"` // Wall clock timestamp for LWW
 	ReplicaID string    `json:"replica_id"`
 	TTL       *int64    `json:"ttl,omitempty"`       // TTL in seconds, nil means no expiration
 	ExpireAt  time.Time `json:"expire_at,omitempty"` // Absolute expiration time
+}
+
+// NewStringValue creates a new Value for regular strings
+func NewStringValue(value string, timestamp int64, replicaID string) *Value {
+	return &Value{
+		Type:      TypeString,
+		Data:      []byte(value),
+		Timestamp: timestamp,
+		ReplicaID: replicaID,
+	}
+}
+
+// NewCounterValue creates a new Value for counters
+func NewCounterValue(counter int64, timestamp int64, replicaID string) *Value {
+	data := make([]byte, 8)
+	binary.BigEndian.PutUint64(data, uint64(counter))
+	return &Value{
+		Type:      TypeCounter,
+		Data:      data,
+		Timestamp: timestamp,
+		ReplicaID: replicaID,
+	}
+}
+
+// String returns the string representation of the value
+func (v *Value) String() string {
+	switch v.Type {
+	case TypeString:
+		return string(v.Data)
+	case TypeCounter:
+		counter := v.Counter()
+		return strconv.FormatInt(counter, 10)
+	default:
+		return ""
+	}
+}
+
+// Counter returns the counter value if type is TypeCounter
+func (v *Value) Counter() int64 {
+	if v.Type != TypeCounter || len(v.Data) != 8 {
+		return 0
+	}
+	return int64(binary.BigEndian.Uint64(v.Data))
+}
+
+// SetCounter sets the counter value and updates the internal bytes
+func (v *Value) SetCounter(counter int64) {
+	if v.Type != TypeCounter {
+		return
+	}
+	if len(v.Data) != 8 {
+		v.Data = make([]byte, 8)
+	}
+	binary.BigEndian.PutUint64(v.Data, uint64(counter))
+}
+
+// Merge merges another Value into this one according to CRDT rules
+func (v *Value) Merge(other *Value) {
+	if v.Type != other.Type {
+		// If types don't match, use the most recent value
+		if other.Timestamp > v.Timestamp {
+			*v = *other
+		}
+		return
+	}
+
+	switch v.Type {
+	case TypeString:
+		// Last-Write-Wins for regular strings
+		if other.Timestamp > v.Timestamp {
+			v.Data = other.Data
+			v.Timestamp = other.Timestamp
+			v.ReplicaID = other.ReplicaID
+		}
+	case TypeCounter:
+		// Accumulate counter values
+		newCounter := v.Counter() + other.Counter()
+		v.SetCounter(newCounter)
+		// Take the latest timestamp
+		if other.Timestamp > v.Timestamp {
+			v.Timestamp = other.Timestamp
+			v.ReplicaID = other.ReplicaID
+		}
+	}
+
+	// Merge TTL - take the longer TTL if both exist
+	if v.TTL != nil && other.TTL != nil {
+		if time.Until(other.ExpireAt) > time.Until(v.ExpireAt) {
+			v.TTL = other.TTL
+			v.ExpireAt = other.ExpireAt
+		}
+	} else if other.TTL != nil {
+		v.TTL = other.TTL
+		v.ExpireAt = other.ExpireAt
+	}
 }
 
 // Store manages the persistent storage of values with CRDT resolution
@@ -67,7 +174,7 @@ func NewStore(dataDir string, redisAddr string, redisDB int) (*Store, error) {
 }
 
 // Set stores a value with CRDT metadata and optional TTL
-func (s *Store) Set(key, value string, timestamp int64, replicaID string, ttl *int64) error {
+func (s *Store) Set(key string, value *Value, ttl *int64) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
@@ -90,7 +197,7 @@ func (s *Store) Set(key, value string, timestamp int64, replicaID string, ttl *i
 		// CRDT conflict resolution
 		if existingValue.TTL == nil {
 			// Existing value has no TTL, it wins unless timestamp is higher
-			if timestamp > existingValue.Timestamp {
+			if value.Timestamp > existingValue.Timestamp {
 				shouldWrite = true
 			}
 		} else if ttl == nil {
@@ -101,7 +208,7 @@ func (s *Store) Set(key, value string, timestamp int64, replicaID string, ttl *i
 			existingRemaining := time.Until(existingValue.ExpireAt).Seconds()
 			newRemaining := float64(*ttl)
 
-			if newRemaining > existingRemaining || (newRemaining == existingRemaining && timestamp > existingValue.Timestamp) {
+			if newRemaining > existingRemaining || (newRemaining == existingRemaining && value.Timestamp > existingValue.Timestamp) {
 				shouldWrite = true
 			}
 		}
@@ -109,18 +216,14 @@ func (s *Store) Set(key, value string, timestamp int64, replicaID string, ttl *i
 
 	if shouldWrite {
 		// Update Redis first
-		if err := s.redis.Set(s.ctx, key, value, redisTTL); err != nil {
+		if err := s.redis.Set(s.ctx, key, value.String(), redisTTL); err != nil {
 			return fmt.Errorf("failed to write to Redis: %v", err)
 		}
 
 		// Then update CRDT state
-		s.items[key] = &Value{
-			Value:     value,
-			Timestamp: timestamp,
-			ReplicaID: replicaID,
-			TTL:       ttl,
-			ExpireAt:  expireAt,
-		}
+		s.items[key] = value
+		s.items[key].TTL = ttl
+		s.items[key].ExpireAt = expireAt
 
 		// Save to disk
 		if err := s.save(); err != nil {
@@ -132,14 +235,14 @@ func (s *Store) Set(key, value string, timestamp int64, replicaID string, ttl *i
 }
 
 // Get retrieves a value, checking both CRDT state and Redis
-func (s *Store) Get(key string) (string, bool) {
+func (s *Store) Get(key string) (*Value, bool) {
 	s.mu.RLock()
 	value, exists := s.items[key]
 	s.mu.RUnlock()
 
 	if !exists {
 		// Key not in CRDT state, don't check Redis as fallback
-		return "", false
+		return nil, false
 	}
 
 	// Check if the value has expired
@@ -152,10 +255,10 @@ func (s *Store) Get(key string) (string, bool) {
 
 		// Also remove from Redis
 		s.redis.Delete(s.ctx, key)
-		return "", false
+		return nil, false
 	}
 
-	return value.Value, true
+	return value, true
 }
 
 // Delete removes a value from both CRDT state and Redis
@@ -263,12 +366,12 @@ func (s *Store) load() error {
 				continue
 			}
 			duration := remaining
-			if err := s.redis.Set(s.ctx, key, value.Value, &duration); err != nil {
+			if err := s.redis.Set(s.ctx, key, value.String(), &duration); err != nil {
 				return fmt.Errorf("failed to sync key %s to Redis with TTL: %v", key, err)
 			}
 		} else {
 			// No TTL, just set the value
-			if err := s.redis.Set(s.ctx, key, value.Value, nil); err != nil {
+			if err := s.redis.Set(s.ctx, key, value.String(), nil); err != nil {
 				return fmt.Errorf("failed to sync key %s to Redis: %v", key, err)
 			}
 		}

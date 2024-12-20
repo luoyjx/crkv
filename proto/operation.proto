@@ -14,6 +14,7 @@ message Operation {
 enum OperationType {
     SET = 0;
     DELETE = 1;
+    INCR = 2;
     // Add more operation types as needed
 }
 
