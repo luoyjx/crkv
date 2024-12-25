@@ -115,13 +115,64 @@ func (s *Server) applyOperation(op *proto.Operation) error {
 	}
 }
 
+// SetOptions 结构体用于存储 SET 命令的选项
+type SetOptions struct {
+	NX bool
+	XX bool
+	// Get     bool // GET 选项通常在协议层处理，不影响数据存储
+	EX      *time.Duration
+	PX      *time.Duration
+	EXAT    *time.Time
+	PXAT    *time.Time
+	Keepttl bool
+}
+
 // Set implements the SET command
-func (s *Server) Set(key, value string) error {
+func (s *Server) Set(key, value string, options *SetOptions) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
 	timestamp := time.Now().UnixNano()
+	var expireAt *time.Time
+
+	// apply options
+	if options != nil {
+		if options.NX {
+			_, exists := s.store.Get(key)
+			if exists {
+				return nil // Key already exists, do nothing
+			}
+		}
+		if options.XX {
+			_, exists := s.store.Get(key)
+			if !exists {
+				return nil // Key does not exist, do nothing
+			}
+		}
+
+		if options.EX != nil {
+			t := time.Now().Add(*options.EX)
+			expireAt = &t
+		}
+		if options.PX != nil {
+			t := time.Now().Add(*options.PX)
+			expireAt = &t
+		}
+		if options.EXAT != nil {
+			expireAt = options.EXAT
+		}
+		if options.PXAT != nil {
+			expireAt = options.PXAT
+		}
+		if options.Keepttl {
+			if existingValue, exists := s.store.Get(key); exists {
+				expireAt = existingValue.ExpireAt()
+			}
+		}
+	}
+
 	val := storage.NewStringValue(value, timestamp, "server1") // TODO: Make replicaID configurable
+	val.SetExpireAt(expireAt)
 
 	if err := s.store.Set(key, val, nil); err != nil {
 		return fmt.Errorf("failed to set value: %v", err)
@@ -130,10 +181,10 @@ func (s *Server) Set(key, value string) error {
 	// Log the operation
 	op := &proto.Operation{
 		OperationId: fmt.Sprintf("%d-%s", timestamp, key),
-		Type:       proto.OperationType_SET,
-		Command:    "SET",
-		Args:       []string{key, value},
-		Timestamp:  timestamp,
+		Type:        proto.OperationType_SET,
+		Command:     "SET",
+		Args:        []string{key, value},
+		Timestamp:   timestamp,
 	}
 	if err := s.opLog.AddOperation(op); err != nil {
 		return fmt.Errorf("failed to log operation: %v", err)
@@ -162,7 +213,7 @@ func (s *Server) Incr(key string) (int64, error) {
 
 	timestamp := time.Now().UnixNano()
 	value, exists := s.store.Get(key)
-	
+
 	var counter int64
 	if exists {
 		if value.Type != storage.TypeCounter {
@@ -176,7 +227,7 @@ func (s *Server) Incr(key string) (int64, error) {
 			counter = value.Counter()
 		}
 	}
-	
+
 	counter++
 	val := storage.NewCounterValue(counter, timestamp, "server1") // TODO: Make replicaID configurable
 
@@ -187,10 +238,10 @@ func (s *Server) Incr(key string) (int64, error) {
 	// Log the operation
 	op := &proto.Operation{
 		OperationId: fmt.Sprintf("%d-%s", timestamp, key),
-		Type:       proto.OperationType_INCR,
-		Command:    "INCR",
-		Args:       []string{key, strconv.FormatInt(counter, 10)},
-		Timestamp:  timestamp,
+		Type:        proto.OperationType_INCR,
+		Command:     "INCR",
+		Args:        []string{key, strconv.FormatInt(counter, 10)},
+		Timestamp:   timestamp,
 	}
 	if err := s.opLog.AddOperation(op); err != nil {
 		return 0, fmt.Errorf("failed to log operation: %v", err)

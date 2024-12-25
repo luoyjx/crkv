@@ -6,6 +6,8 @@ import (
 
 	"github.com/luoyjx/crdt-redis/server"
 	"github.com/tidwall/redcon"
+
+	"github.com/luoyjx/crdt-redis/network/rediscommands"
 )
 
 // RedisServer handles Redis protocol communication
@@ -33,16 +35,36 @@ func (rs *RedisServer) Start(addr string) error {
 func (rs *RedisServer) handleCommand(conn redcon.Conn, cmd redcon.Command) {
 	switch strings.ToLower(string(cmd.Args[0])) {
 	case "set":
-		if len(cmd.Args) != 3 {
-			conn.WriteError("ERR wrong number of arguments for 'set' command")
+		// Parse the SET command arguments
+		setArgs, err := rediscommands.ParseSetArgs(cmd)
+		if err != nil {
+			// If there's an error parsing the arguments, return an error to the client
+			conn.WriteError("ERR " + err.Error())
 			return
 		}
-		key := string(cmd.Args[1])
-		value := string(cmd.Args[2])
-		if err := rs.server.Set(key, value); err != nil {
+
+		// Check if both NX and XX options are provided, which is an error
+		if setArgs.NX && setArgs.XX {
+			conn.WriteError("ERR NX and XX options are mutually exclusive")
+			return
+		}
+
+		// Call the server's Set method with the parsed arguments and options
+		err = rs.server.Set(setArgs.Key, setArgs.Value, &server.SetOptions{
+			NX:      setArgs.NX,
+			XX:      setArgs.XX,
+			EX:      setArgs.EX,
+			PX:      setArgs.PX,
+			EXAT:    setArgs.EXAT,
+			PXAT:    setArgs.PXAT,
+			Keepttl: setArgs.Keepttl,
+		})
+		if err != nil {
+			// If there's an error setting the value, return an error to the client
 			conn.WriteError(fmt.Sprintf("ERR %v", err))
 			return
 		}
+
 		conn.WriteString("OK")
 
 	case "get":
