@@ -30,7 +30,7 @@ func TestServerSetGet(t *testing.T) {
 	defer server.Close()
 
 	// Test basic set and get
-	err = server.Set("key1", "value1")
+	err = server.Set("key1", "value1", nil)
 	if err != nil {
 		t.Errorf("Set failed: %v", err)
 	}
@@ -74,12 +74,12 @@ func TestServerOperationSync(t *testing.T) {
 	defer server.Close()
 
 	// Add some operations
-	err = server.Set("key1", "value1")
+	err = server.Set("key1", "value1", nil)
 	if err != nil {
 		t.Errorf("Set key1 failed: %v", err)
 	}
 
-	err = server.Set("key2", "value2")
+	err = server.Set("key2", "value2", nil)
 	if err != nil {
 		t.Errorf("Set key2 failed: %v", err)
 	}
@@ -122,7 +122,7 @@ func TestServerClose(t *testing.T) {
 	}
 
 	// Set some data
-	err = server.Set("key1", "value1")
+	err = server.Set("key1", "value1", nil)
 	if err != nil {
 		t.Errorf("Set failed: %v", err)
 	}

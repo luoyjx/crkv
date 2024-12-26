@@ -166,13 +166,15 @@ func (s *Server) Set(key, value string, options *SetOptions) error {
 		}
 		if options.Keepttl {
 			if existingValue, exists := s.store.Get(key); exists {
-				expireAt = existingValue.ExpireAt()
+				expireAt = &existingValue.ExpireAt
 			}
 		}
 	}
 
 	val := storage.NewStringValue(value, timestamp, "server1") // TODO: Make replicaID configurable
-	val.SetExpireAt(expireAt)
+	if expireAt != nil {
+		val.SetExpireAt(expireAt)
+	}
 
 	if err := s.store.Set(key, val, nil); err != nil {
 		return fmt.Errorf("failed to set value: %v", err)

@@ -32,7 +32,7 @@ func TestIntegrationBasic(t *testing.T) {
 	defer srv.Close()
 
 	// Test basic operations
-	err = srv.Set("key1", "value1")
+	err = srv.Set("key1", "value1", nil)
 	if err != nil {
 		t.Errorf("Set failed: %v", err)
 	}
@@ -93,12 +93,12 @@ func TestIntegrationMultiServer(t *testing.T) {
 	defer srv2.Close()
 
 	// Set data on server 1
-	if err := srv1.Set("key1", "value1"); err != nil {
+	if err := srv1.Set("key1", "value1", nil); err != nil {
 		t.Fatalf("Failed to set key1 on server 1: %v", err)
 	}
 
 	// Set data on server 2
-	if err := srv2.Set("key2", "value2"); err != nil {
+	if err := srv2.Set("key2", "value2", nil); err != nil {
 		t.Fatalf("Failed to set key2 on server 2: %v", err)
 	}
 
