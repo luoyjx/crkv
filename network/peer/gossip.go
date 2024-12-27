@@ -11,71 +11,97 @@ import (
 
 // GossipConfig holds configuration for the gossip protocol
 type GossipConfig struct {
-	// Number of peers to gossip with in each round
+	// Number of peers to push/pull from in each round
 	FanOut int
 	// Interval between gossip rounds
 	GossipInterval time.Duration
-	// Maximum number of operations to send in each gossip message
+	// Maximum number of operations to send in each message
 	MaxOperations int
 }
 
-// GossipManager manages the gossip protocol
-type GossipManager struct {
-	config GossipConfig
-	peers  map[string]*Peer
-	mu     sync.RWMutex
-
-	// Operation buffer for gossip
-	opBuffer     []*proto.Operation
-	opBufferLock sync.RWMutex
-
-	ctx    context.Context
-	cancel context.CancelFunc
+// Gossip implements the gossip protocol for operation dissemination
+type Gossip struct {
+	config     GossipConfig
+	manager    *Manager
+	operations *OperationBuffer
+	ctx        context.Context
+	cancel     context.CancelFunc
 }
 
-// NewGossipManager creates a new gossip manager
-func NewGossipManager(cfg GossipConfig) *GossipManager {
-	ctx, cancel := context.WithCancel(context.Background())
-	return &GossipManager{
-		config:   cfg,
-		peers:    make(map[string]*Peer),
-		ctx:      ctx,
-		cancel:   cancel,
+// OperationBuffer is a fixed-size buffer for recent operations
+type OperationBuffer struct {
+	mu         sync.RWMutex
+	operations []*proto.Operation
+	maxSize    int
+	current    int
+}
+
+// NewOperationBuffer creates a new operation buffer
+func NewOperationBuffer(size int) *OperationBuffer {
+	return &OperationBuffer{
+		operations: make([]*proto.Operation, size),
+		maxSize:    size,
 	}
 }
 
-// AddPeer adds a peer to the gossip network
-func (g *GossipManager) AddPeer(peer *Peer) {
-	g.mu.Lock()
-	defer g.mu.Unlock()
-	g.peers[peer.ID] = peer
+// Add adds an operation to the buffer
+func (b *OperationBuffer) Add(op *proto.Operation) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+
+	b.operations[b.current] = op
+	b.current = (b.current + 1) % b.maxSize
 }
 
-// RemovePeer removes a peer from the gossip network
-func (g *GossipManager) RemovePeer(peerID string) {
-	g.mu.Lock()
-	defer g.mu.Unlock()
-	delete(g.peers, peerID)
+// GetRecent returns recent operations up to the specified limit
+func (b *OperationBuffer) GetRecent(limit int) []*proto.Operation {
+	b.mu.RLock()
+	defer b.mu.RUnlock()
+
+	result := make([]*proto.Operation, 0, limit)
+	count := 0
+	current := b.current
+
+	// Iterate backwards through the buffer
+	for i := 0; i < b.maxSize && count < limit; i++ {
+		idx := (current - i - 1 + b.maxSize) % b.maxSize
+		if b.operations[idx] != nil {
+			result = append(result, b.operations[idx])
+			count++
+		}
+	}
+
+	return result
+}
+
+// NewGossip creates a new gossip protocol instance
+func NewGossip(manager *Manager, config GossipConfig) *Gossip {
+	ctx, cancel := context.WithCancel(context.Background())
+	return &Gossip{
+		config:     config,
+		manager:    manager,
+		operations: NewOperationBuffer(1000), // Buffer last 1000 operations
+		ctx:        ctx,
+		cancel:     cancel,
+	}
 }
 
 // Start starts the gossip protocol
-func (g *GossipManager) Start() {
+func (g *Gossip) Start() {
 	go g.gossipLoop()
 }
 
 // Stop stops the gossip protocol
-func (g *GossipManager) Stop() {
+func (g *Gossip) Stop() {
 	g.cancel()
 }
 
-// BroadcastOperation broadcasts an operation to the gossip network
-func (g *GossipManager) BroadcastOperation(op *proto.Operation) {
-	g.opBufferLock.Lock()
-	defer g.opBufferLock.Unlock()
-	g.opBuffer = append(g.opBuffer, op)
+// AddOperation adds an operation to be gossiped
+func (g *Gossip) AddOperation(op *proto.Operation) {
+	g.operations.Add(op)
 }
 
-func (g *GossipManager) gossipLoop() {
+func (g *Gossip) gossipLoop() {
 	ticker := time.NewTicker(g.config.GossipInterval)
 	defer ticker.Stop()
 
@@ -89,48 +115,37 @@ func (g *GossipManager) gossipLoop() {
 	}
 }
 
-func (g *GossipManager) doGossip() {
-	g.mu.RLock()
-	peers := make([]*Peer, 0, len(g.peers))
-	for _, p := range g.peers {
-		if p.IsActive() {
-			peers = append(peers, p)
-		}
-	}
-	g.mu.RUnlock()
-
+func (g *Gossip) doGossip() {
+	peers := g.manager.GetPeers()
 	if len(peers) == 0 {
 		return
 	}
 
-	// Select random peers to gossip with
-	numPeers := min(g.config.FanOut, len(peers))
-	selectedPeers := g.selectRandomPeers(peers, numPeers)
+	// Randomly select peers to gossip with
+	selectedPeers := g.selectPeers(peers, g.config.FanOut)
+	if len(selectedPeers) == 0 {
+		return
+	}
 
-	// Get operations to gossip
-	ops := g.getOperationsToGossip()
+	// Get recent operations to gossip
+	ops := g.operations.GetRecent(g.config.MaxOperations)
 	if len(ops) == 0 {
 		return
 	}
 
-	// Create gossip message
-	msg := &proto.Message{
-		Type:       proto.MessageType_GOSSIP,
-		Operations: ops,
-		Timestamp:  time.Now().UnixNano(),
-	}
-
-	// Send to selected peers
+	// Send operations to selected peers
 	for _, peer := range selectedPeers {
-		if err := peer.Send(msg); err != nil {
-			// TODO: Handle error
-			continue
+		for _, op := range ops {
+			if err := peer.Send(op); err != nil {
+				// Log error but continue with other peers
+				continue
+			}
 		}
 	}
 }
 
-func (g *GossipManager) selectRandomPeers(peers []*Peer, n int) []*Peer {
-	if n >= len(peers) {
+func (g *Gossip) selectPeers(peers []*Peer, count int) []*Peer {
+	if len(peers) <= count {
 		return peers
 	}
 
@@ -142,30 +157,5 @@ func (g *GossipManager) selectRandomPeers(peers []*Peer, n int) []*Peer {
 		result[i], result[j] = result[j], result[i]
 	}
 
-	return result[:n]
-}
-
-func (g *GossipManager) getOperationsToGossip() []*proto.Operation {
-	g.opBufferLock.Lock()
-	defer g.opBufferLock.Unlock()
-
-	if len(g.opBuffer) == 0 {
-		return nil
-	}
-
-	numOps := min(g.config.MaxOperations, len(g.opBuffer))
-	ops := make([]*proto.Operation, numOps)
-	copy(ops, g.opBuffer[:numOps])
-	
-	// Remove sent operations from buffer
-	g.opBuffer = g.opBuffer[numOps:]
-	
-	return ops
-}
-
-func min(a, b int) int {
-	if a < b {
-		return a
-	}
-	return b
+	return result[:count]
 }

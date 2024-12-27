@@ -1,13 +1,12 @@
-package network
+package redisprotocol
 
 import (
 	"fmt"
 	"strings"
 
+	"github.com/luoyjx/crdt-redis/redisprotocol/commands"
 	"github.com/luoyjx/crdt-redis/server"
 	"github.com/tidwall/redcon"
-
-	"github.com/luoyjx/crdt-redis/network/rediscommands"
 )
 
 // RedisServer handles Redis protocol communication
@@ -36,7 +35,7 @@ func (rs *RedisServer) handleCommand(conn redcon.Conn, cmd redcon.Command) {
 	switch strings.ToLower(string(cmd.Args[0])) {
 	case "set":
 		// Parse the SET command arguments
-		setArgs, err := rediscommands.ParseSetArgs(cmd)
+		setArgs, err := commands.ParseSetArgs(cmd)
 		if err != nil {
 			// If there's an error parsing the arguments, return an error to the client
 			conn.WriteError("ERR " + err.Error())

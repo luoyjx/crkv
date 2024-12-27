@@ -1,4 +1,4 @@
-package rediscommands
+package commands
 
 import (
 	"errors"

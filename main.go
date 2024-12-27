@@ -9,7 +9,7 @@ import (
 	"syscall"
 
 	"github.com/luoyjx/crdt-redis/consensus"
-	"github.com/luoyjx/crdt-redis/network"
+	"github.com/luoyjx/crdt-redis/redisprotocol"
 	"github.com/luoyjx/crdt-redis/server"
 )
 
@@ -42,7 +42,7 @@ func main() {
 	defer raftNode.Close()
 
 	// Initialize Redis protocol server
-	redisServer := network.NewRedisServer(srv)
+	redisServer := redisprotocol.NewRedisServer(srv)
 	listenAddr := fmt.Sprintf(":%d", *port)
 
 	// Handle graceful shutdown

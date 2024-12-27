@@ -7,6 +7,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/luoyjx/crdt-redis/network/protocol"
 	"github.com/luoyjx/crdt-redis/proto"
 )
 
@@ -15,156 +16,124 @@ type Peer struct {
 	ID        string
 	Addr      string
 	conn      net.Conn
+	codec     *protocol.Codec
+	sendCh    chan *proto.Operation
+	closeCh   chan struct{}
+	closeOnce sync.Once
 	mu        sync.RWMutex
 	lastSeen  time.Time
-	sendChan  chan *proto.Message
-	recvChan  chan *proto.Message
-	ctx       context.Context
-	cancel    context.CancelFunc
-	isActive  bool
-}
-
-// PeerConfig holds configuration for a peer
-type PeerConfig struct {
-	ID       string
-	Addr     string
-	ConnType string // tcp, unix, etc.
 }
 
 // NewPeer creates a new peer instance
-func NewPeer(cfg PeerConfig) *Peer {
-	ctx, cancel := context.WithCancel(context.Background())
+func NewPeer(id string, addr string, conn net.Conn) *Peer {
 	return &Peer{
-		ID:       cfg.ID,
-		Addr:     cfg.Addr,
-		sendChan: make(chan *proto.Message, 100),
-		recvChan: make(chan *proto.Message, 100),
-		ctx:      ctx,
-		cancel:   cancel,
+		ID:       id,
+		Addr:     addr,
+		conn:     conn,
+		codec:    protocol.NewCodec(conn),
+		sendCh:   make(chan *proto.Operation, 1000),
+		closeCh:  make(chan struct{}),
+		lastSeen: time.Now(),
 	}
 }
 
-// Connect establishes connection with the peer
-func (p *Peer) Connect() error {
-	p.mu.Lock()
-	defer p.mu.Unlock()
-
-	if p.isActive {
-		return nil
-	}
-
-	conn, err := net.Dial("tcp", p.Addr)
-	if err != nil {
-		return fmt.Errorf("failed to connect to peer %s: %v", p.ID, err)
-	}
-
-	p.conn = conn
-	p.isActive = true
-	p.lastSeen = time.Now()
-
-	// Start send/receive loops
-	go p.sendLoop()
-	go p.receiveLoop()
-
-	return nil
+// Start starts the peer's send and receive loops
+func (p *Peer) Start(ctx context.Context, handler OperationHandler) {
+	go p.sendLoop(ctx)
+	go p.receiveLoop(ctx, handler)
 }
 
-// Close closes the peer connection
-func (p *Peer) Close() error {
-	p.mu.Lock()
-	defer p.mu.Unlock()
-
-	if !p.isActive {
-		return nil
-	}
-
-	p.cancel()
-	p.isActive = false
-	close(p.sendChan)
-	close(p.recvChan)
-
-	if p.conn != nil {
-		return p.conn.Close()
-	}
-
-	return nil
-}
-
-// Send sends a message to the peer
-func (p *Peer) Send(msg *proto.Message) error {
-	if !p.isActive {
-		return fmt.Errorf("peer %s is not active", p.ID)
-	}
-
+// Send sends an operation to the peer
+func (p *Peer) Send(op *proto.Operation) error {
 	select {
-	case p.sendChan <- msg:
+	case p.sendCh <- op:
 		return nil
-	case <-p.ctx.Done():
-		return fmt.Errorf("peer %s context cancelled", p.ID)
 	default:
 		return fmt.Errorf("send channel full for peer %s", p.ID)
 	}
 }
 
-// Receive returns a channel for receiving messages from the peer
-func (p *Peer) Receive() <-chan *proto.Message {
-	return p.recvChan
+// Close closes the peer connection
+func (p *Peer) Close() {
+	p.closeOnce.Do(func() {
+		close(p.closeCh)
+		p.conn.Close()
+	})
 }
 
-// IsActive returns whether the peer is currently active
-func (p *Peer) IsActive() bool {
-	p.mu.RLock()
-	defer p.mu.RUnlock()
-	return p.isActive
-}
+func (p *Peer) sendLoop(ctx context.Context) {
+	ticker := time.NewTicker(time.Second) // Heartbeat interval
+	defer ticker.Stop()
 
-func (p *Peer) sendLoop() {
 	for {
 		select {
-		case <-p.ctx.Done():
+		case <-ctx.Done():
 			return
-		case msg := <-p.sendChan:
-			if err := p.writeMessage(msg); err != nil {
-				p.handleError(err)
+		case <-p.closeCh:
+			return
+		case op := <-p.sendCh:
+			if err := p.codec.WriteMessage(&protocol.Message{
+				Type:      protocol.MessageTypeOperation,
+				Operation: op,
+			}); err != nil {
+				p.Close()
+				return
+			}
+		case <-ticker.C:
+			// Send heartbeat
+			if err := p.codec.WriteMessage(&protocol.Message{
+				Type: protocol.MessageTypeHeartbeat,
+			}); err != nil {
+				p.Close()
 				return
 			}
 		}
 	}
 }
 
-func (p *Peer) receiveLoop() {
+func (p *Peer) receiveLoop(ctx context.Context, handler OperationHandler) {
 	for {
 		select {
-		case <-p.ctx.Done():
+		case <-ctx.Done():
+			return
+		case <-p.closeCh:
 			return
 		default:
-			msg, err := p.readMessage()
-			if err != nil {
-				p.handleError(err)
-				return
+		}
+
+		msg, err := p.codec.ReadMessage()
+		if err != nil {
+			p.Close()
+			return
+		}
+
+		p.mu.Lock()
+		p.lastSeen = time.Now()
+		p.mu.Unlock()
+
+		switch msg.Type {
+		case protocol.MessageTypeOperation:
+			if msg.Operation != nil && handler != nil {
+				if err := handler.HandleOperation(ctx, msg.Operation); err != nil {
+					// Log error but continue processing
+					continue
+				}
 			}
-			p.recvChan <- msg
+		case protocol.MessageTypeHeartbeat:
+			// Update last seen time only
+			continue
 		}
 	}
 }
 
-func (p *Peer) writeMessage(msg *proto.Message) error {
-	// TODO: Implement message serialization and writing
-	return nil
+// IsAlive returns true if the peer is considered alive
+func (p *Peer) IsAlive() bool {
+	p.mu.RLock()
+	defer p.mu.RUnlock()
+	return time.Since(p.lastSeen) < 5*time.Second
 }
 
-func (p *Peer) readMessage() (*proto.Message, error) {
-	// TODO: Implement message deserialization and reading
-	return nil, nil
-}
-
-func (p *Peer) handleError(err error) {
-	p.mu.Lock()
-	defer p.mu.Unlock()
-
-	if p.isActive {
-		p.isActive = false
-		p.conn.Close()
-		// TODO: Implement reconnection logic
-	}
+// OperationHandler handles operations received from peers
+type OperationHandler interface {
+	HandleOperation(ctx context.Context, op *proto.Operation) error
 }
