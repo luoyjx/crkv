@@ -69,11 +69,10 @@ func TestIntegrationMultiServer(t *testing.T) {
 
 	// Create servers with shorter sync interval
 	srv1, err := server.NewServerWithConfig(server.Config{
-		DataDir:      tmpDir1 + "/store",
-		RedisAddr:    "localhost:6379",
-		RedisDB:      0,
-		OpLogPath:    tmpDir1 + "/oplog/operations.log",
-		SyncInterval: 500 * time.Millisecond,
+		DataDir:   tmpDir1 + "/store",
+		RedisAddr: "localhost:6379",
+		RedisDB:   0,
+		OpLogPath: tmpDir1 + "/oplog/operations.log",
 	})
 	if err != nil {
 		t.Fatalf("Failed to create server 1: %v", err)
@@ -81,11 +80,10 @@ func TestIntegrationMultiServer(t *testing.T) {
 	defer srv1.Close()
 
 	srv2, err := server.NewServerWithConfig(server.Config{
-		DataDir:      tmpDir2 + "/store",
-		RedisAddr:    "localhost:6379",
-		RedisDB:      1,
-		OpLogPath:    tmpDir2 + "/oplog/operations.log",
-		SyncInterval: 500 * time.Millisecond,
+		DataDir:   tmpDir2 + "/store",
+		RedisAddr: "localhost:6379",
+		RedisDB:   1,
+		OpLogPath: tmpDir2 + "/oplog/operations.log",
 	})
 	if err != nil {
 		t.Fatalf("Failed to create server 2: %v", err)

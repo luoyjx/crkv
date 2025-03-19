@@ -10,14 +10,16 @@ import (
 	"path/filepath"
 	"sync"
 	"time"
+
+	"github.com/luoyjx/crdt-redis/storage/crdt" // Import crdt package
 )
 
 // Store manages the persistent storage of values with CRDT resolution
 type Store struct {
 	mu              sync.RWMutex
-	items           map[string]*Value // In-memory CRDT state
-	dataPath        string            // Path to persist CRDT state
-	redis           *RedisStore       // Local Redis instance
+	items           map[string]*crdt.Value // In-memory CRDT state
+	dataPath        string                 // Path to persist CRDT state
+	redis           *RedisStore            // Local Redis instance
 	cleanupInterval time.Duration
 	stopCleanup     chan struct{}
 	ctx             context.Context
@@ -30,14 +32,14 @@ func NewStore(dataDir string, redisAddr string, redisDB int) (*Store, error) {
 		return nil, err
 	}
 
-	redis, err := NewRedisStore(redisAddr, redisDB)
+	redis, err := NewRedisStore(redisAddr, redisDB, "") // Add empty replicaID
 	if err != nil {
 		return nil, err
 	}
 
 	ctx, cancel := context.WithCancel(context.Background())
 	store := &Store{
-		items:           make(map[string]*Value),
+		items:           make(map[string]*crdt.Value),
 		dataPath:        filepath.Join(dataDir, "store.json"),
 		redis:           redis,
 		cleanupInterval: time.Second * 1,
@@ -58,12 +60,9 @@ func NewStore(dataDir string, redisAddr string, redisDB int) (*Store, error) {
 }
 
 // Set stores a value with CRDT metadata and optional TTL
-func (s *Store) Set(key string, value *Value, ttl *int64) error {
+func (s *Store) Set(key string, value *crdt.Value, ttl *int64) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-
-	existingValue, exists := s.items[key]
-	shouldWrite := false
 
 	// Calculate expiration time if TTL is provided
 	var expireAt time.Time
@@ -74,52 +73,33 @@ func (s *Store) Set(key string, value *Value, ttl *int64) error {
 		expireAt = time.Now().Add(duration)
 	}
 
-	if !exists {
-		// New key, always write
-		shouldWrite = true
-	} else {
-		// CRDT conflict resolution
-		if existingValue.TTL == nil {
-			// Existing value has no TTL, it wins unless timestamp is higher
-			if value.Timestamp > existingValue.Timestamp {
-				shouldWrite = true
-			}
-		} else if ttl == nil {
-			// New value has no TTL, it always wins
-			shouldWrite = true
-		} else {
-			// Both have TTL, compare remaining time and timestamp
-			existingRemaining := time.Until(existingValue.ExpireAt).Seconds()
-			newRemaining := float64(*ttl)
-
-			if newRemaining > existingRemaining || (newRemaining == existingRemaining && value.Timestamp > existingValue.Timestamp) {
-				shouldWrite = true
-			}
+	existingValue, exists := s.items[key]
+	if exists {
+		if value.Timestamp <= existingValue.Timestamp {
+			return nil // Do not update if new timestamp is not greater
 		}
 	}
 
-	if shouldWrite {
-		// Update Redis first
-		if err := s.redis.Set(s.ctx, key, value.String(), redisTTL); err != nil {
-			return fmt.Errorf("failed to write to Redis: %v", err)
-		}
+	// Update Redis first
+	if err := s.redis.Set(s.ctx, key, value.String(), redisTTL); err != nil {
+		return fmt.Errorf("failed to write to Redis: %v", err)
+	}
 
-		// Then update CRDT state
-		s.items[key] = value
-		s.items[key].TTL = ttl
-		s.items[key].ExpireAt = expireAt
+	// Then update CRDT state
+	s.items[key] = value
+	s.items[key].TTL = ttl
+	s.items[key].ExpireAt = expireAt
 
-		// Save to disk
-		if err := s.save(); err != nil {
-			return fmt.Errorf("failed to save to disk: %v", err)
-		}
+	// Save to disk
+	if err := s.save(); err != nil {
+		return fmt.Errorf("failed to save to disk: %v", err)
 	}
 
 	return nil
 }
 
 // Get retrieves a value, checking both CRDT state and Redis
-func (s *Store) Get(key string) (*Value, bool) {
+func (s *Store) Get(key string) (*crdt.Value, bool) { // Return *crdt.Value
 	s.mu.RLock()
 	value, exists := s.items[key]
 	s.mu.RUnlock()

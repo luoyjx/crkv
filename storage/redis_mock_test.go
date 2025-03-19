@@ -16,7 +16,7 @@ type MockRedisClient struct {
 	closed bool
 }
 
-func NewMockRedisClient() *MockRedisClient {
+func NewMockRedisClient(addr string, redisDB int) *MockRedisClient {
 	return &MockRedisClient{
 		data: make(map[string]string),
 		ttls: make(map[string]time.Duration),

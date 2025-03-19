@@ -7,6 +7,22 @@ import (
 	"sync"
 )
 
+// Config holds router configuration
+type Config struct {
+	SelfID   string
+	Addr     string
+	Location *Location
+}
+
+// DefaultConfig returns a default router configuration
+func DefaultConfig() Config {
+	return Config{
+		SelfID:   "default-server-id",                  // 默认 Server ID
+		Addr:     "localhost:8080",                     // 默认监听地址
+		Location: &Location{Latitude: 0, Longitude: 0}, // 默认地理位置
+	}
+}
+
 // Node represents a proxy server node in the cluster
 type Node struct {
 	ID       string
@@ -28,11 +44,11 @@ type Router struct {
 }
 
 // NewRouter creates a new Router instance
-func NewRouter(selfID string, addr string, location *Location) *Router {
+func NewRouter(cfg Config) *Router {
 	self := &Node{
-		ID:       selfID,
-		Addr:     addr,
-		Location: location,
+		ID:       cfg.SelfID,
+		Addr:     cfg.Addr,
+		Location: cfg.Location,
 	}
 
 	return &Router{
