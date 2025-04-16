@@ -6,8 +6,6 @@ import (
 	"strconv"
 	"testing"
 	"time"
-
-	"github.com/luoyjx/crdt-redis/storage/crdt"
 )
 
 type testStore struct {
@@ -29,7 +27,7 @@ func setupTestStore(t *testing.T) *testStore {
 	}
 	redisStore.client = mockRedis
 	store := &Store{
-		items:           make(map[string]*crdt.Value),
+		items:           make(map[string]*Value),
 		dataPath:        tmpDir + "/store.json",
 		redis:           redisStore,
 		cleanupInterval: time.Second * 1,
@@ -58,10 +56,7 @@ func TestStore_SetGet(t *testing.T) {
 	key := "test_key"
 	value := "test_value"
 	timestamp := time.Now().UnixNano()
-	val := &crdt.Value{
-		Value:     value,
-		Timestamp: timestamp,
-	}
+	val := NewStringValue(value, timestamp, "test-replica")
 
 	if err := ts.Store.Set(key, val, nil); err != nil {
 		t.Fatalf("Failed to set value: %v", err)
@@ -82,10 +77,7 @@ func TestStore_Counter(t *testing.T) {
 
 	key := "counter_key"
 	timestamp := time.Now().UnixNano()
-	val := &crdt.Value{
-		Value:     "42",
-		Timestamp: timestamp,
-	}
+	val := NewCounterValue(42, timestamp, "test-replica")
 
 	if err := ts.Store.Set(key, val, nil); err != nil {
 		t.Fatalf("Failed to set counter: %v", err)
@@ -112,10 +104,7 @@ func TestStore_TTL(t *testing.T) {
 	key := "ttl_key"
 	value := "ttl_value"
 	timestamp := time.Now().UnixNano()
-	val := &crdt.Value{
-		Value:     value,
-		Timestamp: timestamp,
-	}
+	val := NewStringValue(value, timestamp, "test-replica")
 	ttl := int64(1) // 1 second TTL
 
 	if err := ts.Store.Set(key, val, &ttl); err != nil {
@@ -149,14 +138,8 @@ func TestStore_Merge(t *testing.T) {
 	timestamp2 := timestamp1 + 1
 
 	// Test string merge (LWW)
-	val1 := &crdt.Value{
-		Value:     "value1",
-		Timestamp: timestamp1,
-	}
-	val2 := &crdt.Value{
-		Value:     "value2",
-		Timestamp: timestamp2,
-	}
+	val1 := NewStringValue("value1", timestamp1, "test-replica")
+	val2 := NewStringValue("value2", timestamp2, "test-replica")
 
 	if err := ts.Store.Set(key, val1, nil); err != nil {
 		t.Fatalf("Failed to set first value: %v", err)
@@ -173,16 +156,10 @@ func TestStore_Merge(t *testing.T) {
 		t.Errorf("Got %v, want %v", got.String(), "value2")
 	}
 
-	// Test counter merge (should be LWW)
+	// Test counter merge (LWW, not accumulate)
 	counterKey := "counter_merge"
-	counter1 := &crdt.Value{
-		Value:     "5",
-		Timestamp: timestamp1,
-	}
-	counter2 := &crdt.Value{
-		Value:     "3",
-		Timestamp: timestamp2,
-	}
+	counter1 := NewCounterValue(5, timestamp1, "test-replica")
+	counter2 := NewCounterValue(3, timestamp2, "test-replica")
 
 	if err := ts.Store.Set(counterKey, counter1, nil); err != nil {
 		t.Fatalf("Failed to set first counter: %v", err)
@@ -200,19 +177,50 @@ func TestStore_Merge(t *testing.T) {
 	}
 }
 
+func TestStore_Incr(t *testing.T) {
+	ts := setupTestStore(t)
+	defer ts.cleanup()
+
+	key := "incr_key"
+	// Initial value not set, should start from 1
+	val, err := ts.Store.Incr(key)
+	if err != nil {
+		t.Fatalf("Failed to incr: %v", err)
+	}
+	if val != 1 {
+		t.Errorf("Got %v, want %v", val, 1)
+	}
+
+	// Incr again, should be 2
+	val, err = ts.Store.Incr(key)
+	if err != nil {
+		t.Fatalf("Failed to incr: %v", err)
+	}
+	if val != 2 {
+		t.Errorf("Got %v, want %v", val, 2)
+	}
+
+	// Set a string value, then Incr (should error if not integer)
+	ts.Store.Set(key, NewStringValue("notanint", time.Now().UnixNano(), "test-replica"), nil)
+	_, err = ts.Store.Incr(key)
+	if err == nil {
+		t.Error("Expected error when incrementing non-integer value")
+	}
+}
+
 func TestStore_CRDT(t *testing.T) {
 	ts := setupTestStore(t)
 	defer ts.cleanup()
 
 	// Test that higher timestamp wins
-	err := ts.Store.Set("key1", &crdt.Value{Value: "value1", Timestamp: 100}, nil)
+	err := ts.Store.Set("key1", NewStringValue("value1", 100, "test-replica"), nil)
 	if err != nil {
 		t.Errorf("First set failed: %v", err)
 	}
 
 	time.Sleep(10 * time.Millisecond) // Ensure timestamp is different
 
-	err = ts.Store.Set("key1", &crdt.Value{Value: "value2", Timestamp: 200}, nil)
+	err = ts.Store.Set("key1", NewStringValue("value2", 200, "test-replica"), nil)
 	if err != nil {
 		t.Errorf("Second set failed: %v", err)
 	}
@@ -234,13 +242,13 @@ func TestStore_CRDT(t *testing.T) {
 	if !exists {
 		t.Error("Key doesn't exist in Redis")
 	}
-	if redisValue != "value2" {
-		t.Errorf("Redis has wrong value. Expected 'value2', got '%s'", redisValue)
+	if redisValue.String() != "value2" {
+		t.Errorf("Redis has wrong value. Expected 'value2', got '%s'", redisValue.String())
 	}
 
 	// Test that lower timestamp doesn't override higher
 	time.Sleep(10 * time.Millisecond) // Ensure timestamp is different
-	err = ts.Store.Set("key1", &crdt.Value{Value: "value3", Timestamp: 150}, nil)
+	err = ts.Store.Set("key1", NewStringValue("value3", 150, "test-replica"), nil)
 	if err != nil {
 		t.Errorf("Third set failed: %v", err)
 	}
@@ -261,8 +269,8 @@ func TestStore_CRDT(t *testing.T) {
 	if !exists {
 		t.Error("Key doesn't exist in Redis")
 	}
-	if redisValue != "value2" {
-		t.Errorf("Redis has wrong value. Expected 'value2', got '%s'", redisValue)
+	if redisValue.String() != "value2" {
+		t.Errorf("Redis has wrong value. Expected 'value2', got '%s'", redisValue.String())
 	}
 }
 
@@ -273,7 +281,7 @@ func TestStore_Persistence(t *testing.T) {
 	timestamp := time.Now().UnixNano()
 
 	// Set some data
-	err := ts.Store.Set("key1", &crdt.Value{Value: "value1", Timestamp: timestamp}, nil)
+	err := ts.Store.Set("key1", NewStringValue("value1", timestamp, "test-replica"), nil)
 	if err != nil {
 		t.Errorf("Set failed: %v", err)
 	}
@@ -292,7 +300,7 @@ func TestStore_Persistence(t *testing.T) {
 	}
 	redisStore2.client = mockRedis // Replace real redis client with mock client
 	store2 := &Store{
-		items:           make(map[string]*crdt.Value),
+		items:           make(map[string]*Value),
 		dataPath:        tmpDir + "/store.json",
 		redis:           redisStore2,
 		cleanupInterval: time.Second * 1,
@@ -327,7 +335,7 @@ func TestStore_Persistence(t *testing.T) {
 	if !exists {
 		t.Error("Key doesn't exist in Redis after reopening")
 	}
-	if redisValue != "value1" {
-		t.Errorf("Wrong value in Redis after reopening. Expected 'value1', got '%s'", redisValue)
+	if redisValue.String() != "value1" {
+		t.Errorf("Wrong value in Redis after reopening. Expected 'value1', got '%s'", redisValue.String())
 	}
 }

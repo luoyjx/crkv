@@ -18,7 +18,8 @@ import (
 // Server represents the main CRDT Redis server
 type Server struct {
 	mu          sync.RWMutex
-	store       *storage.RedisStore
+	store       *storage.Store
+	redisStore  *storage.RedisStore
 	opLog       *operation.OperationLog
 	replicaID   string
 	peerManager *peer.Manager // Peer manager for inter-server communication
@@ -62,14 +63,20 @@ func NewServer(dataDir string, redisAddr string, oplogPath string) (*Server, err
 
 // NewServerWithConfig creates a new CRDT Redis server instance with configuration
 func NewServerWithConfig(cfg Config) (*Server, error) {
-	store, err := storage.NewRedisStore(cfg.RedisAddr, cfg.RedisDB, cfg.ReplicaID)
+	redisStore, err := storage.NewRedisStore(cfg.RedisAddr, cfg.RedisDB, cfg.ReplicaID)
 	if err != nil {
+		return nil, fmt.Errorf("failed to create redis store: %v", err)
+	}
+	store, err := storage.NewStore(cfg.DataDir, cfg.RedisAddr, cfg.RedisDB)
+	if err != nil {
+		redisStore.Close()
 		return nil, fmt.Errorf("failed to create store: %v", err)
 	}
 
 	opLog, err := operation.NewOperationLog(cfg.OpLogPath)
 	if err != nil {
-		store.Close() // Clean up store if oplog creation fails
+		store.Close()
+		redisStore.Close()
 		return nil, fmt.Errorf("failed to create operation log: %v", err)
 	}
 
@@ -80,10 +87,11 @@ func NewServerWithConfig(cfg Config) (*Server, error) {
 	}
 
 	server := &Server{
-		store:     store,
-		opLog:     opLog,
-		replicaID: replicaID,
-		router:    routing.NewRouter(cfg.RouterConfig), // Initialize router
+		store:      store,
+		redisStore: redisStore,
+		opLog:      opLog,
+		replicaID:  replicaID,
+		router:     routing.NewRouter(cfg.RouterConfig), // Initialize router
 	}
 
 	// Initialize peer manager
@@ -123,7 +131,8 @@ func (s *Server) applyOperation(op *proto.Operation) error {
 			return fmt.Errorf("invalid SET operation args: expected 2, got %d", len(op.Args))
 		}
 		key, value := op.Args[0], op.Args[1]
-		return s.store.Set(context.Background(), key, value, nil)
+		val := storage.NewStringValue(value, time.Now().UnixNano(), s.replicaID)
+		return s.store.Set(key, val, nil)
 	default:
 		return fmt.Errorf("unknown operation type: %v", op.Type)
 	}
@@ -149,70 +158,67 @@ func (s *Server) Set(key string, value string, options *SetOptions) error {
 	timestamp := time.Now().UnixNano()
 	var expireAt *time.Time
 
-	// apply options
 	if options != nil {
 		if options.NX {
-			if options.NX {
-				_, _, _ = s.store.Get(context.Background(), key)
-				if options.NX {
-					return nil // Key already exists, do nothing
-				}
+			_, exists := s.store.Get(key)
+			if exists {
+				return nil // Key already exists, do nothing
 			}
-			if options.XX {
-				_, _, _ = s.store.Get(context.Background(), key)
-				if options.XX {
-					return nil // Key does not exist, do nothing
-				}
-			}
-
-			if options.EX != nil {
-				t := time.Now().Add(*options.EX)
-				expireAt = &t
-			}
-			if options.PX != nil {
-				t := time.Now().Add(*options.PX)
-				expireAt = &t
-			}
-			if options.EXAT != nil {
-				expireAt = options.EXAT
-			}
-			if options.PXAT != nil {
-				expireAt = options.PXAT
-			}
-			if options.Keepttl {
-				if _, exists, _ := s.store.Get(context.Background(), key); exists {
-					// expireAt = existingValue.ExpireAt // 假设 RedisStore 返回包含 ExpireAt 的 Value 类型
-				}
+		}
+		if options.XX {
+			_, exists := s.store.Get(key)
+			if !exists {
+				return nil // Key does not exist, do nothing
 			}
 		}
 
-		var ttl *time.Duration
-		if expireAt != nil {
-			duration := time.Until(*expireAt)
-			ttl = &duration
+		if options.EX != nil {
+			t := time.Now().Add(*options.EX)
+			expireAt = &t
 		}
-
-		if err := s.store.Set(context.Background(), key, value, ttl); err != nil {
-			return fmt.Errorf("failed to set value: %v", err)
+		if options.PX != nil {
+			t := time.Now().Add(*options.PX)
+			expireAt = &t
 		}
-
-		// Log the operation
-		op := &proto.Operation{
-			OperationId: fmt.Sprintf("%d-%s", timestamp, key),
-			Type:        proto.OperationType_SET,
-			Command:     "SET",
-			Args:        []string{key, value},
-			Timestamp:   timestamp,
+		if options.EXAT != nil {
+			expireAt = options.EXAT
 		}
-		if err := s.opLog.AddOperation(op); err != nil {
-			return fmt.Errorf("failed to log operation: %v", err)
+		if options.PXAT != nil {
+			expireAt = options.PXAT
 		}
-
-		// Broadcast the operation to other peers
-		s.peerManager.Broadcast(op)
-
-		return nil
+		if options.Keepttl {
+			if v, exists := s.store.Get(key); exists {
+				expireAt = &v.ExpireAt
+			}
+		}
 	}
+
+	var ttl *int64
+	if expireAt != nil {
+		dur := int64(time.Until(*expireAt).Seconds())
+		ttl = &dur
+	}
+
+	val := storage.NewStringValue(value, timestamp, s.replicaID)
+	if err := s.store.Set(key, val, ttl); err != nil {
+		return fmt.Errorf("failed to set value: %v", err)
+	}
+
+	// Log the operation
+	op := &proto.Operation{
+		OperationId: fmt.Sprintf("%d-%s", timestamp, key),
+		Type:        proto.OperationType_SET,
+		Command:     "SET",
+		Args:        []string{key, value},
+		Timestamp:   timestamp,
+	}
+	if err := s.opLog.AddOperation(op); err != nil {
+		return fmt.Errorf("failed to log operation: %v", err)
+	}
+
+	s.peerManager.Broadcast(op)
+
+	return nil
 }
 
 // Get implements the GET command
@@ -220,12 +226,12 @@ func (s *Server) Get(key string) (string, bool) {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 
-	value, exists, _ := s.store.Get(context.Background(), key)
+	value, exists := s.store.Get(key)
 	if !exists {
 		return "", false
 	}
 
-	return value, exists
+	return value.String(), true
 }
 
 // Incr implements the INCR command
@@ -234,18 +240,9 @@ func (s *Server) Incr(key string) (int64, error) {
 	defer s.mu.Unlock()
 
 	timestamp := time.Now().UnixNano()
-	_, exists, _ := s.store.Get(context.Background(), key)
-
-	var counter int64
-	if exists {
-		// always start from 0 for incr command in phase 1
-		counter = 0
-	}
-
-	counter++
-
-	if err := s.store.Set(context.Background(), key, strconv.FormatInt(counter, 10), nil); err != nil {
-		return counter, fmt.Errorf("failed to set counter: %v", err)
+	val, err := s.store.Incr(key)
+	if err != nil {
+		return val, fmt.Errorf("failed to incr: %v", err)
 	}
 
 	// Log the operation
@@ -253,14 +250,14 @@ func (s *Server) Incr(key string) (int64, error) {
 		OperationId: fmt.Sprintf("%d-%s", timestamp, key),
 		Type:        proto.OperationType_INCR,
 		Command:     "INCR",
-		Args:        []string{key, strconv.FormatInt(counter, 10)},
+		Args:        []string{key, strconv.FormatInt(val, 10)},
 		Timestamp:   timestamp,
 	}
 	if err := s.opLog.AddOperation(op); err != nil {
 		return 0, fmt.Errorf("failed to log operation: %v", err)
 	}
 
-	return counter, nil
+	return val, nil
 }
 
 // Close closes the server and its resources

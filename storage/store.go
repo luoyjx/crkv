@@ -8,18 +8,18 @@ import (
 	"log"
 	"os"
 	"path/filepath"
+	"strconv"
 	"sync"
 	"time"
-
-	"github.com/luoyjx/crdt-redis/storage/crdt" // Import crdt package
+	// Import crdt package
 )
 
 // Store manages the persistent storage of values with CRDT resolution
 type Store struct {
 	mu              sync.RWMutex
-	items           map[string]*crdt.Value // In-memory CRDT state
-	dataPath        string                 // Path to persist CRDT state
-	redis           *RedisStore            // Local Redis instance
+	items           map[string]*Value // In-memory CRDT state
+	dataPath        string            // Path to persist CRDT state
+	redis           *RedisStore       // Local Redis instance
 	cleanupInterval time.Duration
 	stopCleanup     chan struct{}
 	ctx             context.Context
@@ -39,7 +39,7 @@ func NewStore(dataDir string, redisAddr string, redisDB int) (*Store, error) {
 
 	ctx, cancel := context.WithCancel(context.Background())
 	store := &Store{
-		items:           make(map[string]*crdt.Value),
+		items:           make(map[string]*Value),
 		dataPath:        filepath.Join(dataDir, "store.json"),
 		redis:           redis,
 		cleanupInterval: time.Second * 1,
@@ -59,8 +59,8 @@ func NewStore(dataDir string, redisAddr string, redisDB int) (*Store, error) {
 	return store, nil
 }
 
-// Set stores a value with CRDT metadata and optional TTL
-func (s *Store) Set(key string, value *crdt.Value, ttl *int64) error {
+// Set stores a value with CRDT metadata and optional TTL using LWW semantics only
+func (s *Store) Set(key string, value *Value, ttl *int64) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
@@ -81,7 +81,7 @@ func (s *Store) Set(key string, value *crdt.Value, ttl *int64) error {
 	}
 
 	// Update Redis first
-	if err := s.redis.Set(s.ctx, key, value.String(), redisTTL); err != nil {
+	if err := s.redis.Set(s.ctx, key, value, redisTTL); err != nil {
 		return fmt.Errorf("failed to write to Redis: %v", err)
 	}
 
@@ -99,13 +99,12 @@ func (s *Store) Set(key string, value *crdt.Value, ttl *int64) error {
 }
 
 // Get retrieves a value, checking both CRDT state and Redis
-func (s *Store) Get(key string) (*crdt.Value, bool) { // Return *crdt.Value
+func (s *Store) Get(key string) (*Value, bool) {
 	s.mu.RLock()
 	value, exists := s.items[key]
 	s.mu.RUnlock()
 
 	if !exists {
-		// Key not in CRDT state, don't check Redis as fallback
 		return nil, false
 	}
 
@@ -230,12 +229,12 @@ func (s *Store) load() error {
 				continue
 			}
 			duration := remaining
-			if err := s.redis.Set(s.ctx, key, value.String(), &duration); err != nil {
+			if err := s.redis.Set(s.ctx, key, value, &duration); err != nil {
 				return fmt.Errorf("failed to sync key %s to Redis with TTL: %v", key, err)
 			}
 		} else {
 			// No TTL, just set the value
-			if err := s.redis.Set(s.ctx, key, value.String(), nil); err != nil {
+			if err := s.redis.Set(s.ctx, key, value, nil); err != nil {
 				return fmt.Errorf("failed to sync key %s to Redis: %v", key, err)
 			}
 		}
@@ -276,4 +275,64 @@ func (s *Store) GetTTL(key string) (int64, bool) {
 		s.save()
 	}
 	return 0, false
+}
+
+// Incr increments the value at key by 1 using counter semantics
+func (s *Store) Incr(key string) (int64, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	timestamp := time.Now().UnixNano()
+	var counter int64
+	if val, exists := s.items[key]; exists {
+		if val.Type == TypeCounter {
+			counter = val.Counter()
+		} else {
+			parsed, err := strconv.ParseInt(val.String(), 10, 64)
+			if err != nil {
+				return 0, fmt.Errorf("value is not an integer")
+			}
+			counter = parsed
+		}
+	}
+	counter++
+	newVal := NewCounterValue(counter, timestamp, "")
+	if err := s.redis.Set(s.ctx, key, newVal, nil); err != nil {
+		return counter, fmt.Errorf("failed to write to Redis: %v", err)
+	}
+	s.items[key] = newVal
+	if err := s.save(); err != nil {
+		return counter, fmt.Errorf("failed to save to disk: %v", err)
+	}
+	return counter, nil
+}
+
+// IncrBy increments the value at key by increment using counter semantics
+func (s *Store) IncrBy(key string, increment int64) (int64, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	timestamp := time.Now().UnixNano()
+	var counter int64
+	if val, exists := s.items[key]; exists {
+		if val.Type == TypeCounter {
+			counter = val.Counter()
+		} else {
+			parsed, err := strconv.ParseInt(val.String(), 10, 64)
+			if err != nil {
+				return 0, fmt.Errorf("value is not an integer")
+			}
+			counter = parsed
+		}
+	}
+	counter += increment
+	newVal := NewCounterValue(counter, timestamp, "")
+	if err := s.redis.Set(s.ctx, key, newVal, nil); err != nil {
+		return counter, fmt.Errorf("failed to write to Redis: %v", err)
+	}
+	s.items[key] = newVal
+	if err := s.save(); err != nil {
+		return counter, fmt.Errorf("failed to save to disk: %v", err)
+	}
+	return counter, nil
 }

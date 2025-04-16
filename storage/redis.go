@@ -6,7 +6,7 @@ import (
 	"sync"
 	"time"
 
-	"github.com/luoyjx/crdt-redis/storage/crdt" // Import correct crdt package
+	// Import correct crdt package
 	"github.com/redis/go-redis/v9"
 )
 
@@ -23,7 +23,7 @@ type RedisClient interface {
 type RedisStore struct {
 	client RedisClient
 	mu     sync.RWMutex
-	values map[string]*crdt.Value
+	values map[string]*Value
 }
 
 // NewRedisStore creates a new Redis store with CRDT support
@@ -41,56 +41,48 @@ func NewRedisStore(addr string, redisDB int, replicaID string) (*RedisStore, err
 
 	store := &RedisStore{
 		client: client,
-		values: make(map[string]*crdt.Value), // Use crdt.Value instead of ValueWithTimestamp
+		values: make(map[string]*Value),
 	}
 	return store, nil
 }
 
-// Set sets a value in Redis with LWW (Last Write Wins) strategy
-func (rs *RedisStore) Set(ctx context.Context, key string, value string, ttl *time.Duration) error {
+// Set sets a value in Redis with LWW semantics only
+func (rs *RedisStore) Set(ctx context.Context, key string, value *Value, ttl *time.Duration) error {
 	rs.mu.Lock()
 	defer rs.mu.Unlock()
 
-	now := time.Now().UnixNano()
-
-	// Check if we have a newer value already
-	if existing, exists := rs.values[key]; exists && existing.Timestamp > now {
-		return nil // Ignore older write
+	existing, exists := rs.values[key]
+	if exists {
+		if value.Timestamp <= existing.Timestamp {
+			return nil // Ignore older write
+		}
 	}
 
-	// Store new value with timestamp
-	rs.values[key] = &crdt.Value{
-		Value:     value,
-		Timestamp: now,
-	}
-
-	// Persist to Redis
+	rs.values[key] = value
 	if ttl == nil {
-		return rs.client.Set(ctx, key, value, 0).Err() // 0 means no expiration
+		return rs.client.Set(ctx, key, value.String(), 0).Err()
 	}
-	return rs.client.Set(ctx, key, value, *ttl).Err()
+	return rs.client.Set(ctx, key, value.String(), *ttl).Err()
 }
 
-// Get gets a value from Redis using LWW strategy
-func (rs *RedisStore) Get(ctx context.Context, key string) (string, bool, error) {
+// Get gets a value from Redis using LWW or counter semantics
+func (rs *RedisStore) Get(ctx context.Context, key string) (*Value, bool, error) {
 	rs.mu.RLock()
 	defer rs.mu.RUnlock()
 
-	// First check our local CRDT state
 	if val, exists := rs.values[key]; exists {
-		return val.Value, true, nil
+		return val, true, nil
 	}
 
-	// Fallback to Redis if not in local state
-	val, err := rs.client.Get(ctx, key).Result()
+	valStr, err := rs.client.Get(ctx, key).Result()
 	if errors.Is(err, redis.Nil) {
-		return "", false, nil
+		return nil, false, nil
 	}
 	if err != nil {
-		return "", false, err
+		return nil, false, err
 	}
-
-	return val, true, nil
+	// Default to string type if not found in local state
+	return NewStringValue(valStr, time.Now().UnixNano(), ""), true, nil
 }
 
 // Delete deletes a key from Redis
