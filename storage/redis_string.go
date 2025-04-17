@@ -100,7 +100,6 @@ func (v *Value) Merge(other *Value) {
 		if other.Timestamp > v.Timestamp {
 			v.Data = other.Data
 			v.Timestamp = other.Timestamp
-			v.ReplicaID = other.ReplicaID
 		}
 	case TypeCounter:
 		// Accumulate counter values
@@ -109,7 +108,6 @@ func (v *Value) Merge(other *Value) {
 		// Take the latest timestamp
 		if other.Timestamp > v.Timestamp {
 			v.Timestamp = other.Timestamp
-			v.ReplicaID = other.ReplicaID
 		}
 	}
 
