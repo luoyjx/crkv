@@ -8,7 +8,6 @@ import (
 	"os/signal"
 	"syscall"
 
-	"github.com/luoyjx/crdt-redis/consensus"
 	"github.com/luoyjx/crdt-redis/redisprotocol"
 	"github.com/luoyjx/crdt-redis/server"
 )
@@ -32,14 +31,6 @@ func main() {
 		log.Fatalf("Failed to create server: %v", err)
 	}
 	defer srv.Close()
-
-	// Initialize Raft consensus
-	raftAddr := fmt.Sprintf(":%d", *raftPort)
-	raftNode, err := consensus.NewRaftNode(*dataDir, raftAddr)
-	if err != nil {
-		log.Fatalf("Failed to initialize Raft: %v", err)
-	}
-	defer raftNode.Close()
 
 	// Initialize Redis protocol server
 	redisServer := redisprotocol.NewRedisServer(srv)

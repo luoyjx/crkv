@@ -1,13 +1,10 @@
 package server
 
 import (
-	"context"
 	"fmt"
 	"os"
 	"testing"
 	"time"
-
-	"github.com/luoyjx/crdt-redis/routing"
 )
 
 func TestServerSetGet(t *testing.T) {
@@ -86,14 +83,10 @@ func TestServerInterServerSync(t *testing.T) {
 
 	// Create two servers with unique configurations
 	server1, err := NewServerWithConfig(Config{
-		DataDir:   tmpDir1 + "/store",
-		RedisAddr: redisAddr1,
-		OpLogPath: tmpDir1 + "/oplog/operations.log",
-		ReplicaID: "server1",
-		RouterConfig: routing.Config{
-			SelfID: "server1",
-			Addr:   peerAddr1,
-		},
+		DataDir:    tmpDir1 + "/store",
+		RedisAddr:  redisAddr1,
+		OpLogPath:  tmpDir1 + "/oplog/operations.log",
+		ReplicaID:  "server1",
 		ListenAddr: peerAddr1,
 	})
 	if err != nil {
@@ -102,14 +95,10 @@ func TestServerInterServerSync(t *testing.T) {
 	defer server1.Close()
 
 	server2, err := NewServerWithConfig(Config{
-		DataDir:   tmpDir2 + "/store",
-		RedisAddr: redisAddr2,
-		OpLogPath: tmpDir2 + "/oplog/operations.log",
-		ReplicaID: "server2",
-		RouterConfig: routing.Config{
-			SelfID: "server2",
-			Addr:   peerAddr2,
-		},
+		DataDir:    tmpDir2 + "/store",
+		RedisAddr:  redisAddr2,
+		OpLogPath:  tmpDir2 + "/oplog/operations.log",
+		ReplicaID:  "server2",
 		ListenAddr: peerAddr2,
 	})
 	if err != nil {
@@ -119,16 +108,6 @@ func TestServerInterServerSync(t *testing.T) {
 
 	// Wait for servers to initialize
 	time.Sleep(500 * time.Millisecond)
-
-	// Connect server1 to server2
-	node2 := &routing.Node{
-		ID:   "server2",
-		Addr: peerAddr2,
-	}
-	err = server1.peerManager.Connect(context.Background(), node2)
-	if err != nil {
-		t.Fatalf("Failed to connect server1 to server2: %v", err)
-	}
 
 	// Set value on server1
 	err = server1.Set("key1", "value1", nil)
