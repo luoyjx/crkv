@@ -15,6 +15,16 @@ enum OperationType {
     SET = 0;
     DELETE = 1;
     INCR = 2;
+    LPUSH = 3;
+    RPUSH = 4;
+    LPOP = 5;
+    RPOP = 6;
+    SADD = 7;
+    SREM = 8;
+    HSET = 9;
+    HDEL = 10;
+    ZADD = 11;
+    ZREM = 12;
     // Add more operation types as needed
 }
 

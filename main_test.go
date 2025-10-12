@@ -1,11 +1,17 @@
 package main
 
 import (
+	"encoding/json"
+	"fmt"
+	"net/http"
 	"os"
+	"strconv"
 	"testing"
 	"time"
 
+	"github.com/luoyjx/crdt-redis/proto"
 	"github.com/luoyjx/crdt-redis/server"
+	"github.com/luoyjx/crdt-redis/syncer"
 )
 
 func TestIntegrationBasic(t *testing.T) {
@@ -44,6 +50,11 @@ func TestIntegrationBasic(t *testing.T) {
 }
 
 func TestIntegrationMultiServer(t *testing.T) {
+	// Skip if running short tests (since this involves HTTP servers)
+	if testing.Short() {
+		t.Skip("skipping multi-server integration test in short mode")
+	}
+
 	// Create temporary directories for servers
 	tmpDir1, err := os.MkdirTemp("", "server1-test-*")
 	if err != nil {
@@ -67,12 +78,13 @@ func TestIntegrationMultiServer(t *testing.T) {
 		}
 	}
 
-	// Create servers with shorter sync interval
+	// Create servers with different Redis DBs to avoid conflicts
 	srv1, err := server.NewServerWithConfig(server.Config{
 		DataDir:   tmpDir1 + "/store",
 		RedisAddr: "localhost:6379",
-		RedisDB:   0,
+		RedisDB:   10, // Use higher DB numbers to avoid conflicts
 		OpLogPath: tmpDir1 + "/oplog/operations.log",
+		ReplicaID: "test-server-1",
 	})
 	if err != nil {
 		t.Fatalf("Failed to create server 1: %v", err)
@@ -82,13 +94,113 @@ func TestIntegrationMultiServer(t *testing.T) {
 	srv2, err := server.NewServerWithConfig(server.Config{
 		DataDir:   tmpDir2 + "/store",
 		RedisAddr: "localhost:6379",
-		RedisDB:   1,
+		RedisDB:   11, // Use higher DB numbers to avoid conflicts
 		OpLogPath: tmpDir2 + "/oplog/operations.log",
+		ReplicaID: "test-server-2",
 	})
 	if err != nil {
 		t.Fatalf("Failed to create server 2: %v", err)
 	}
 	defer srv2.Close()
+
+	// Set up HTTP sync endpoints for both servers
+	httpPort1 := 18081
+	httpPort2 := 18082
+
+	// Setup HTTP endpoints for server 1
+	mux1 := http.NewServeMux()
+	mux1.HandleFunc("/ops", func(w http.ResponseWriter, r *http.Request) {
+		sinceStr := r.URL.Query().Get("since")
+		var since int64
+		if sinceStr != "" {
+			if v, err := strconv.ParseInt(sinceStr, 10, 64); err == nil {
+				since = v
+			}
+		}
+		ops, _ := srv1.OpLog().GetOperations(since)
+		batch := proto.OperationBatch{Operations: ops}
+		json.NewEncoder(w).Encode(batch)
+	})
+	mux1.HandleFunc("/apply", func(w http.ResponseWriter, r *http.Request) {
+		var batch proto.OperationBatch
+		if err := json.NewDecoder(r.Body).Decode(&batch); err == nil {
+			for _, op := range batch.Operations {
+				srv1.HandleOperation(r.Context(), op)
+			}
+		}
+		w.WriteHeader(http.StatusOK)
+	})
+
+	// Setup HTTP endpoints for server 2
+	mux2 := http.NewServeMux()
+	mux2.HandleFunc("/ops", func(w http.ResponseWriter, r *http.Request) {
+		sinceStr := r.URL.Query().Get("since")
+		var since int64
+		if sinceStr != "" {
+			if v, err := strconv.ParseInt(sinceStr, 10, 64); err == nil {
+				since = v
+			}
+		}
+		ops, _ := srv2.OpLog().GetOperations(since)
+		batch := proto.OperationBatch{Operations: ops}
+		json.NewEncoder(w).Encode(batch)
+	})
+	mux2.HandleFunc("/apply", func(w http.ResponseWriter, r *http.Request) {
+		var batch proto.OperationBatch
+		if err := json.NewDecoder(r.Body).Decode(&batch); err == nil {
+			for _, op := range batch.Operations {
+				srv2.HandleOperation(r.Context(), op)
+			}
+		}
+		w.WriteHeader(http.StatusOK)
+	})
+
+	// Start HTTP servers
+	server1 := &http.Server{
+		Addr:    fmt.Sprintf(":%d", httpPort1),
+		Handler: mux1,
+	}
+	server2 := &http.Server{
+		Addr:    fmt.Sprintf(":%d", httpPort2),
+		Handler: mux2,
+	}
+
+	go server1.ListenAndServe()
+	go server2.ListenAndServe()
+
+	defer func() {
+		server1.Close()
+		server2.Close()
+	}()
+
+	// Give HTTP servers time to start
+	time.Sleep(100 * time.Millisecond)
+
+	// Create syncers with peer configuration
+	peer1Addr := fmt.Sprintf("http://localhost:%d", httpPort1)
+	peer2Addr := fmt.Sprintf("http://localhost:%d", httpPort2)
+
+	syncer1 := syncer.New(syncer.Config{
+		SelfAddress: peer1Addr,
+		Peers:       []syncer.Peer{{Address: peer2Addr}},
+		Interval:    200 * time.Millisecond, // Faster sync for testing
+	}, srv1)
+
+	syncer2 := syncer.New(syncer.Config{
+		SelfAddress: peer2Addr,
+		Peers:       []syncer.Peer{{Address: peer1Addr}},
+		Interval:    200 * time.Millisecond, // Faster sync for testing
+	}, srv2)
+
+	// Start syncers
+	stopSync := make(chan struct{})
+	defer close(stopSync)
+
+	syncer1.Start(stopSync)
+	syncer2.Start(stopSync)
+
+	// Give syncers time to start
+	time.Sleep(200 * time.Millisecond)
 
 	// Set data on server 1
 	if err := srv1.Set("key1", "value1", nil); err != nil {
@@ -101,12 +213,12 @@ func TestIntegrationMultiServer(t *testing.T) {
 	}
 
 	// Wait for sync with timeout
-	timeout := time.After(5 * time.Second)
+	timeout := time.After(10 * time.Second) // Increased timeout
 	syncDone := make(chan struct{})
 
 	go func() {
 		// Verify data with retries
-		ticker := time.NewTicker(100 * time.Millisecond)
+		ticker := time.NewTicker(200 * time.Millisecond)
 		defer ticker.Stop()
 
 		for {

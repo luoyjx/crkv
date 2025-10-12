@@ -92,3 +92,12 @@ func ParseSetArgs(cmd redcon.Command) (*SetArgs, error) {
 	}
 	return args, nil
 }
+
+// ParseInt64 parses a string into int64 with range checking
+func ParseInt64(s string) (int64, error) {
+	v, err := strconv.ParseInt(s, 10, 64)
+	if err != nil {
+		return 0, err
+	}
+	return v, nil
+}

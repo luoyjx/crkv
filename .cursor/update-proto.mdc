@@ -1,0 +1,7 @@
+---
+description: 
+globs:
+alwaysApply: true
+---
+
+当 .proto 文件更新后，重新成成 .pb.go 文件时，需要使用 `make proto` 命名生成

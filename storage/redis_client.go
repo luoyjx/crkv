@@ -187,11 +187,166 @@ type RedisStore struct {
 	values map[string]*Value // In-memory redis string state
 }
 
+// NullRedisClient implements RedisClient interface but does nothing (for Redis-free mode)
+type NullRedisClient struct{}
+
+func NewNullRedisClient() *NullRedisClient {
+	return &NullRedisClient{}
+}
+
+func (n *NullRedisClient) Set(ctx context.Context, key string, value interface{}, expiration time.Duration) *redis.StatusCmd {
+	cmd := redis.NewStatusCmd(ctx, "set", key, value)
+	cmd.SetVal("OK")
+	return cmd
+}
+
+func (n *NullRedisClient) Get(ctx context.Context, key string) *redis.StringCmd {
+	cmd := redis.NewStringCmd(ctx, "get", key)
+	cmd.SetErr(redis.Nil)
+	return cmd
+}
+
+func (n *NullRedisClient) Append(ctx context.Context, key, value string) *redis.IntCmd {
+	cmd := redis.NewIntCmd(ctx, "append", key, value)
+	cmd.SetVal(int64(len(value)))
+	return cmd
+}
+
+func (n *NullRedisClient) GetRange(ctx context.Context, key string, start, end int64) *redis.StringCmd {
+	cmd := redis.NewStringCmd(ctx, "getrange", key, start, end)
+	cmd.SetVal("")
+	return cmd
+}
+
+func (n *NullRedisClient) SetRange(ctx context.Context, key string, offset int64, value string) *redis.IntCmd {
+	cmd := redis.NewIntCmd(ctx, "setrange", key, offset, value)
+	cmd.SetVal(int64(len(value)))
+	return cmd
+}
+
+func (n *NullRedisClient) StrLen(ctx context.Context, key string) *redis.IntCmd {
+	cmd := redis.NewIntCmd(ctx, "strlen", key)
+	cmd.SetVal(0)
+	return cmd
+}
+
+func (n *NullRedisClient) GetSet(ctx context.Context, key string, value interface{}) *redis.StringCmd {
+	cmd := redis.NewStringCmd(ctx, "getset", key, value)
+	cmd.SetErr(redis.Nil)
+	return cmd
+}
+
+func (n *NullRedisClient) GetDel(ctx context.Context, key string) *redis.StringCmd {
+	cmd := redis.NewStringCmd(ctx, "getdel", key)
+	cmd.SetErr(redis.Nil)
+	return cmd
+}
+
+func (n *NullRedisClient) GetEx(ctx context.Context, key string, expiration time.Duration) *redis.StringCmd {
+	cmd := redis.NewStringCmd(ctx, "getex", key)
+	cmd.SetErr(redis.Nil)
+	return cmd
+}
+
+func (n *NullRedisClient) MGet(ctx context.Context, keys ...string) *redis.SliceCmd {
+	cmd := redis.NewSliceCmd(ctx, append([]interface{}{"mget"}, keys)...)
+	result := make([]interface{}, len(keys))
+	for i := range result {
+		result[i] = nil
+	}
+	cmd.SetVal(result)
+	return cmd
+}
+
+func (n *NullRedisClient) MSet(ctx context.Context, values ...interface{}) *redis.StatusCmd {
+	cmd := redis.NewStatusCmd(ctx, append([]interface{}{"mset"}, values...)...)
+	cmd.SetVal("OK")
+	return cmd
+}
+
+func (n *NullRedisClient) MSetNX(ctx context.Context, values ...interface{}) *redis.BoolCmd {
+	cmd := redis.NewBoolCmd(ctx, append([]interface{}{"msetnx"}, values...)...)
+	cmd.SetVal(true)
+	return cmd
+}
+
+func (n *NullRedisClient) SetEX(ctx context.Context, key string, value interface{}, expiration time.Duration) *redis.StatusCmd {
+	cmd := redis.NewStatusCmd(ctx, "setex", key, int(expiration.Seconds()), value)
+	cmd.SetVal("OK")
+	return cmd
+}
+
+func (n *NullRedisClient) PSetEX(ctx context.Context, key string, value interface{}, expiration time.Duration) *redis.StatusCmd {
+	cmd := redis.NewStatusCmd(ctx, "psetex", key, int(expiration.Milliseconds()), value)
+	cmd.SetVal("OK")
+	return cmd
+}
+
+func (n *NullRedisClient) SetNX(ctx context.Context, key string, value interface{}, expiration time.Duration) *redis.BoolCmd {
+	cmd := redis.NewBoolCmd(ctx, "setnx", key, value)
+	cmd.SetVal(true)
+	return cmd
+}
+
+func (n *NullRedisClient) Incr(ctx context.Context, key string) *redis.IntCmd {
+	cmd := redis.NewIntCmd(ctx, "incr", key)
+	cmd.SetVal(1)
+	return cmd
+}
+
+func (n *NullRedisClient) Decr(ctx context.Context, key string) *redis.IntCmd {
+	cmd := redis.NewIntCmd(ctx, "decr", key)
+	cmd.SetVal(-1)
+	return cmd
+}
+
+func (n *NullRedisClient) IncrBy(ctx context.Context, key string, value int64) *redis.IntCmd {
+	cmd := redis.NewIntCmd(ctx, "incrby", key, value)
+	cmd.SetVal(value)
+	return cmd
+}
+
+func (n *NullRedisClient) DecrBy(ctx context.Context, key string, value int64) *redis.IntCmd {
+	cmd := redis.NewIntCmd(ctx, "decrby", key, value)
+	cmd.SetVal(-value)
+	return cmd
+}
+
+func (n *NullRedisClient) IncrByFloat(ctx context.Context, key string, value float64) *redis.FloatCmd {
+	cmd := redis.NewFloatCmd(ctx, "incrbyfloat", key, value)
+	cmd.SetVal(value)
+	return cmd
+}
+
+func (n *NullRedisClient) Del(ctx context.Context, keys ...string) *redis.IntCmd {
+	cmd := redis.NewIntCmd(ctx, append([]interface{}{"del"}, keys)...)
+	cmd.SetVal(int64(len(keys)))
+	return cmd
+}
+
+func (n *NullRedisClient) TTL(ctx context.Context, key string) *redis.DurationCmd {
+	cmd := redis.NewDurationCmd(ctx, time.Second, "ttl", key)
+	cmd.SetVal(-1 * time.Second)
+	return cmd
+}
+
+func (n *NullRedisClient) Close() error {
+	return nil
+}
+
 // NewRedisStore creates a new Redis store with CRDT support
 func NewRedisStore(addr string, redisDB int, replicaID string) (*RedisStore, error) {
-	client, err := NewCustomRedisClient(addr, redisDB)
-	if err != nil {
-		return nil, err
+	var client RedisClient
+	var err error
+
+	if addr == "" {
+		// Use null client when no Redis address is provided (for testing or Redis-free mode)
+		client = NewNullRedisClient()
+	} else {
+		client, err = NewCustomRedisClient(addr, redisDB)
+		if err != nil {
+			return nil, err
+		}
 	}
 
 	store := &RedisStore{
@@ -218,6 +373,25 @@ func (rs *RedisStore) Set(ctx context.Context, key string, value *Value, ttl *ti
 		return rs.client.Set(ctx, key, value.String(), 0).Err()
 	}
 	return rs.client.Set(ctx, key, value.String(), *ttl).Err()
+}
+
+// SetTTL updates only the TTL on the given key in Redis, leaving value/timestamp intact
+func (rs *RedisStore) SetTTL(ctx context.Context, key string, ttl *time.Duration) error {
+	rs.mu.RLock()
+	val, exists := rs.values[key]
+	rs.mu.RUnlock()
+	if !exists {
+		// Try read from Redis to avoid losing value
+		v, ok, err := rs.Get(ctx, key)
+		if err != nil || !ok {
+			return err
+		}
+		val = v
+	}
+	if ttl == nil {
+		return rs.client.Set(ctx, key, val.String(), 0).Err()
+	}
+	return rs.client.Set(ctx, key, val.String(), *ttl).Err()
 }
 
 // Get gets a value from Redis using LWW or counter semantics

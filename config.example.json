@@ -1,0 +1,35 @@
+{
+  "server_port": 6379,
+  "http_port": 8080,
+  "replica_id": "server-001",
+  "data_dir": "./data",
+  "oplog_path": "./data/oplog.json",
+  "redis_addr": "localhost:6379",
+  "redis_db": 0,
+  "peers": [
+    "http://server-002:8080",
+    "http://server-003:8080"
+  ],
+  "sync_interval": "5s",
+  "sync_timeout": "30s",
+  "max_retries": 3,
+  "retry_interval": "1s",
+  "discovery_mode": "static",
+  "discovery_addr": "",
+  "discovery_interval": "30s",
+  "cluster_name": "crdt-redis-cluster",
+  "max_connections": 1000,
+  "read_timeout": "30s",
+  "write_timeout": "30s",
+  "keepalive_timeout": "300s",
+  "max_memory": 1073741824,
+  "gc_interval": "60s",
+  "log_level": "info",
+  "log_file": "",
+  "log_format": "text",
+  "enable_tls": false,
+  "tls_cert_file": "",
+  "tls_key_file": "",
+  "auth_token": ""
+}
+

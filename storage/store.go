@@ -18,10 +18,12 @@ import (
 type Store struct {
 	mu              sync.RWMutex
 	items           map[string]*Value // In-memory CRDT state
-	dataPath        string            // Path to persist CRDT state
+	dataPath        string            // Path to persist CRDT state (legacy)
 	redis           *RedisStore       // Local Redis instance
+	segmentManager  *SegmentManager   // Optimized persistence with append-only logs
 	cleanupInterval time.Duration
 	stopCleanup     chan struct{}
+	closed          bool // Flag to prevent multiple closes
 	ctx             context.Context
 	cancel          context.CancelFunc
 }
@@ -37,19 +39,26 @@ func NewStore(dataDir string, redisAddr string, redisDB int) (*Store, error) {
 		return nil, err
 	}
 
+	// Initialize segment manager for optimized persistence
+	segmentManager, err := NewSegmentManager(filepath.Join(dataDir, "segments"))
+	if err != nil {
+		return nil, fmt.Errorf("failed to create segment manager: %v", err)
+	}
+
 	ctx, cancel := context.WithCancel(context.Background())
 	store := &Store{
 		items:           make(map[string]*Value),
 		dataPath:        filepath.Join(dataDir, "store.json"),
 		redis:           redis,
+		segmentManager:  segmentManager,
 		cleanupInterval: time.Second * 1,
 		stopCleanup:     make(chan struct{}),
 		ctx:             ctx,
 		cancel:          cancel,
 	}
 
-	// Load existing CRDT state if any
-	if err := store.load(); err != nil {
+	// Load existing CRDT state from segments
+	if err := store.loadFromSegments(); err != nil {
 		return nil, err
 	}
 
@@ -137,10 +146,76 @@ func (s *Store) Delete(key string) error {
 	return s.redis.Delete(s.ctx, key)
 }
 
+// UpdateTTLDuration sets TTL for a key using a duration. If duration <= 0, the key is deleted.
+func (s *Store) UpdateTTLDuration(key string, d time.Duration) (bool, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	v, ok := s.items[key]
+	if !ok {
+		return false, nil
+	}
+	if d <= 0 {
+		delete(s.items, key)
+		if err := s.save(); err != nil {
+			return false, err
+		}
+		if err := s.redis.Delete(s.ctx, key); err != nil {
+			return false, err
+		}
+		return true, nil
+	}
+	expireAt := time.Now().Add(d)
+	v.SetExpireAt(&expireAt)
+	if err := s.save(); err != nil {
+		return false, err
+	}
+	if err := s.redis.SetTTL(s.ctx, key, &d); err != nil {
+		return false, err
+	}
+	return true, nil
+}
+
+// UpdateExpireAt sets absolute expiration time for a key.
+func (s *Store) UpdateExpireAt(key string, at time.Time) (bool, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	v, ok := s.items[key]
+	if !ok {
+		return false, nil
+	}
+	if time.Now().After(at) || time.Now().Equal(at) {
+		delete(s.items, key)
+		if err := s.save(); err != nil {
+			return false, err
+		}
+		if err := s.redis.Delete(s.ctx, key); err != nil {
+			return false, err
+		}
+		return true, nil
+	}
+	v.SetExpireAt(&at)
+	if err := s.save(); err != nil {
+		return false, err
+	}
+	d := time.Until(at)
+	if err := s.redis.SetTTL(s.ctx, key, &d); err != nil {
+		return false, err
+	}
+	return true, nil
+}
+
 // Close closes the store and its resources
 func (s *Store) Close() error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+
+	// Prevent multiple closes
+	if s.closed {
+		return nil
+	}
+	s.closed = true
 
 	// Save current state to disk
 	if err := s.save(); err != nil {
@@ -152,6 +227,13 @@ func (s *Store) Close() error {
 
 	// Cancel context
 	s.cancel()
+
+	// Close segment manager
+	if s.segmentManager != nil {
+		if err := s.segmentManager.Close(); err != nil {
+			return fmt.Errorf("failed to close segment manager: %v", err)
+		}
+	}
 
 	return nil
 }
@@ -305,6 +387,194 @@ func (s *Store) Incr(key string) (int64, error) {
 		return counter, fmt.Errorf("failed to save to disk: %v", err)
 	}
 	return counter, nil
+}
+
+// LPush adds elements to the head of a list
+func (s *Store) LPush(key string, values ...string) (int64, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	timestamp := time.Now().UnixNano()
+	var list *CRDTList
+
+	if val, exists := s.items[key]; exists && val.Type == TypeList {
+		list = val.List()
+		if list == nil {
+			return 0, fmt.Errorf("invalid list data")
+		}
+	} else {
+		// Create new list
+		newVal := NewListValue(timestamp, "")
+		list = newVal.List()
+		s.items[key] = newVal
+	}
+
+	// Add values in reverse order to maintain Redis LPUSH semantics
+	for i := len(values) - 1; i >= 0; i-- {
+		list.LPush(values[i], timestamp, "")
+	}
+
+	// Update the value
+	s.items[key].SetList(list, timestamp)
+
+	// Update Redis (store as JSON for now)
+	if err := s.redis.Set(s.ctx, key, s.items[key], nil); err != nil {
+		return int64(list.Len()), fmt.Errorf("failed to write to Redis: %v", err)
+	}
+
+	if err := s.save(); err != nil {
+		return int64(list.Len()), fmt.Errorf("failed to save to disk: %v", err)
+	}
+
+	return int64(list.Len()), nil
+}
+
+// RPush adds elements to the tail of a list
+func (s *Store) RPush(key string, values ...string) (int64, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	timestamp := time.Now().UnixNano()
+	var list *CRDTList
+
+	if val, exists := s.items[key]; exists && val.Type == TypeList {
+		list = val.List()
+		if list == nil {
+			return 0, fmt.Errorf("invalid list data")
+		}
+	} else {
+		// Create new list
+		newVal := NewListValue(timestamp, "")
+		list = newVal.List()
+		s.items[key] = newVal
+	}
+
+	// Add values in order
+	for _, value := range values {
+		list.RPush(value, timestamp, "")
+	}
+
+	// Update the value
+	s.items[key].SetList(list, timestamp)
+
+	// Update Redis
+	if err := s.redis.Set(s.ctx, key, s.items[key], nil); err != nil {
+		return int64(list.Len()), fmt.Errorf("failed to write to Redis: %v", err)
+	}
+
+	if err := s.save(); err != nil {
+		return int64(list.Len()), fmt.Errorf("failed to save to disk: %v", err)
+	}
+
+	return int64(list.Len()), nil
+}
+
+// LPop removes and returns the first element from a list
+func (s *Store) LPop(key string) (string, bool, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	val, exists := s.items[key]
+	if !exists || val.Type != TypeList {
+		return "", false, nil
+	}
+
+	list := val.List()
+	if list == nil {
+		return "", false, fmt.Errorf("invalid list data")
+	}
+
+	value, ok := list.LPop()
+	if !ok {
+		return "", false, nil
+	}
+
+	// Update the value
+	timestamp := time.Now().UnixNano()
+	val.SetList(list, timestamp)
+
+	// Update Redis
+	if err := s.redis.Set(s.ctx, key, val, nil); err != nil {
+		return value, true, fmt.Errorf("failed to write to Redis: %v", err)
+	}
+
+	if err := s.save(); err != nil {
+		return value, true, fmt.Errorf("failed to save to disk: %v", err)
+	}
+
+	return value, true, nil
+}
+
+// RPop removes and returns the last element from a list
+func (s *Store) RPop(key string) (string, bool, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	val, exists := s.items[key]
+	if !exists || val.Type != TypeList {
+		return "", false, nil
+	}
+
+	list := val.List()
+	if list == nil {
+		return "", false, fmt.Errorf("invalid list data")
+	}
+
+	value, ok := list.RPop()
+	if !ok {
+		return "", false, nil
+	}
+
+	// Update the value
+	timestamp := time.Now().UnixNano()
+	val.SetList(list, timestamp)
+
+	// Update Redis
+	if err := s.redis.Set(s.ctx, key, val, nil); err != nil {
+		return value, true, fmt.Errorf("failed to write to Redis: %v", err)
+	}
+
+	if err := s.save(); err != nil {
+		return value, true, fmt.Errorf("failed to save to disk: %v", err)
+	}
+
+	return value, true, nil
+}
+
+// LRange returns elements in the specified range
+func (s *Store) LRange(key string, start, stop int) ([]string, error) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+
+	val, exists := s.items[key]
+	if !exists || val.Type != TypeList {
+		return []string{}, nil
+	}
+
+	list := val.List()
+	if list == nil {
+		return nil, fmt.Errorf("invalid list data")
+	}
+
+	return list.Range(start, stop), nil
+}
+
+// LLen returns the length of a list
+func (s *Store) LLen(key string) (int64, error) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+
+	val, exists := s.items[key]
+	if !exists || val.Type != TypeList {
+		return 0, nil
+	}
+
+	list := val.List()
+	if list == nil {
+		return 0, fmt.Errorf("invalid list data")
+	}
+
+	return int64(list.Len()), nil
 }
 
 // IncrBy increments the value at key by increment using counter semantics

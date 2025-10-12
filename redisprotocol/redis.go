@@ -2,10 +2,12 @@ package redisprotocol
 
 import (
 	"fmt"
+	"strconv"
 	"strings"
 
 	"github.com/luoyjx/crdt-redis/redisprotocol/commands"
 	"github.com/luoyjx/crdt-redis/server"
+	"github.com/luoyjx/crdt-redis/storage"
 	"github.com/tidwall/redcon"
 )
 
@@ -79,8 +81,618 @@ func (rs *RedisServer) handleCommand(conn redcon.Conn, cmd redcon.Command) {
 			conn.WriteNull()
 		}
 
+	case "ping":
+		if len(cmd.Args) == 1 {
+			conn.WriteString("PONG")
+		} else if len(cmd.Args) == 2 {
+			conn.WriteBulk(cmd.Args[1])
+		} else {
+			conn.WriteError("ERR wrong number of arguments for 'ping' command")
+		}
+
+	case "echo":
+		if len(cmd.Args) != 2 {
+			conn.WriteError("ERR wrong number of arguments for 'echo' command")
+			return
+		}
+		conn.WriteBulk(cmd.Args[1])
+
+	case "info":
+		// Simple INFO response for basic compatibility
+		info := "# Server\r\nredis_version:7.0.0-crdt\r\nredis_mode:standalone\r\n# Replication\r\nrole:master\r\n"
+		conn.WriteBulk([]byte(info))
+
 	default:
-		conn.WriteError("ERR unknown command")
+		switch strings.ToLower(string(cmd.Args[0])) {
+		case "exists":
+			if len(cmd.Args) < 2 {
+				conn.WriteError("ERR wrong number of arguments for 'exists' command")
+				return
+			}
+			var keys []string
+			for i := 1; i < len(cmd.Args); i++ {
+				keys = append(keys, string(cmd.Args[i]))
+			}
+			n := rs.server.Exists(keys...)
+			conn.WriteInt64(n)
+		case "ttl":
+			if len(cmd.Args) != 2 {
+				conn.WriteError("ERR wrong number of arguments for 'ttl' command")
+				return
+			}
+			key := string(cmd.Args[1])
+			ttl := rs.server.TTL(key)
+			conn.WriteInt64(ttl)
+		case "pttl":
+			if len(cmd.Args) != 2 {
+				conn.WriteError("ERR wrong number of arguments for 'pttl' command")
+				return
+			}
+			key := string(cmd.Args[1])
+			ttl := rs.server.PTTL(key)
+			conn.WriteInt64(ttl)
+		case "getdel":
+			if len(cmd.Args) != 2 {
+				conn.WriteError("ERR wrong number of arguments for 'getdel' command")
+				return
+			}
+			key := string(cmd.Args[1])
+			val, ok, err := rs.server.GetDel(key)
+			if err != nil {
+				conn.WriteError(fmt.Sprintf("ERR %v", err))
+				return
+			}
+			if ok {
+				conn.WriteBulkString(val)
+			} else {
+				conn.WriteNull()
+			}
+		case "expire":
+			if len(cmd.Args) != 3 {
+				conn.WriteError("ERR wrong number of arguments for 'expire' command")
+				return
+			}
+			key := string(cmd.Args[1])
+			seconds, err := commands.ParseInt64(string(cmd.Args[2]))
+			if err != nil {
+				conn.WriteError("ERR value is not an integer or out of range")
+				return
+			}
+			n, err := rs.server.Expire(key, seconds)
+			if err != nil {
+				conn.WriteError(fmt.Sprintf("ERR %v", err))
+				return
+			}
+			conn.WriteInt64(n)
+		case "pexpire":
+			if len(cmd.Args) != 3 {
+				conn.WriteError("ERR wrong number of arguments for 'pexpire' command")
+				return
+			}
+			key := string(cmd.Args[1])
+			ms, err := commands.ParseInt64(string(cmd.Args[2]))
+			if err != nil {
+				conn.WriteError("ERR value is not an integer or out of range")
+				return
+			}
+			n, err := rs.server.PExpire(key, ms)
+			if err != nil {
+				conn.WriteError(fmt.Sprintf("ERR %v", err))
+				return
+			}
+			conn.WriteInt64(n)
+		case "expireat":
+			if len(cmd.Args) != 3 {
+				conn.WriteError("ERR wrong number of arguments for 'expireat' command")
+				return
+			}
+			key := string(cmd.Args[1])
+			ts, err := commands.ParseInt64(string(cmd.Args[2]))
+			if err != nil {
+				conn.WriteError("ERR value is not an integer or out of range")
+				return
+			}
+			n, err := rs.server.ExpireAt(key, ts)
+			if err != nil {
+				conn.WriteError(fmt.Sprintf("ERR %v", err))
+				return
+			}
+			conn.WriteInt64(n)
+		case "del":
+			if len(cmd.Args) < 2 {
+				conn.WriteError("ERR wrong number of arguments for 'del' command")
+				return
+			}
+			var keys []string
+			for i := 1; i < len(cmd.Args); i++ {
+				keys = append(keys, string(cmd.Args[i]))
+			}
+			removed, err := rs.server.Del(keys...)
+			if err != nil {
+				conn.WriteError(fmt.Sprintf("ERR %v", err))
+				return
+			}
+			conn.WriteInt64(removed)
+		case "incr":
+			if len(cmd.Args) != 2 {
+				conn.WriteError("ERR wrong number of arguments for 'incr' command")
+				return
+			}
+			key := string(cmd.Args[1])
+			val, err := rs.server.Incr(key)
+			if err != nil {
+				conn.WriteError(fmt.Sprintf("ERR %v", err))
+				return
+			}
+			conn.WriteInt64(val)
+		case "incrby":
+			if len(cmd.Args) != 3 {
+				conn.WriteError("ERR wrong number of arguments for 'incrby' command")
+				return
+			}
+			key := string(cmd.Args[1])
+			delta, err := commands.ParseInt64(string(cmd.Args[2]))
+			if err != nil {
+				conn.WriteError("ERR value is not an integer or out of range")
+				return
+			}
+			val, err := rs.server.IncrBy(key, delta)
+			if err != nil {
+				conn.WriteError(fmt.Sprintf("ERR %v", err))
+				return
+			}
+			conn.WriteInt64(val)
+		case "decr":
+			if len(cmd.Args) != 2 {
+				conn.WriteError("ERR wrong number of arguments for 'decr' command")
+				return
+			}
+			key := string(cmd.Args[1])
+			val, err := rs.server.Decr(key)
+			if err != nil {
+				conn.WriteError(fmt.Sprintf("ERR %v", err))
+				return
+			}
+			conn.WriteInt64(val)
+		case "decrby":
+			if len(cmd.Args) != 3 {
+				conn.WriteError("ERR wrong number of arguments for 'decrby' command")
+				return
+			}
+			key := string(cmd.Args[1])
+			delta, err := commands.ParseInt64(string(cmd.Args[2]))
+			if err != nil {
+				conn.WriteError("ERR value is not an integer or out of range")
+				return
+			}
+			val, err := rs.server.DecrBy(key, delta)
+			if err != nil {
+				conn.WriteError(fmt.Sprintf("ERR %v", err))
+				return
+			}
+			conn.WriteInt64(val)
+		case "lpush":
+			if len(cmd.Args) < 3 {
+				conn.WriteError("ERR wrong number of arguments for 'lpush' command")
+				return
+			}
+			key := string(cmd.Args[1])
+			var values []string
+			for i := 2; i < len(cmd.Args); i++ {
+				values = append(values, string(cmd.Args[i]))
+			}
+			length, err := rs.server.LPush(key, values...)
+			if err != nil {
+				conn.WriteError(fmt.Sprintf("ERR %v", err))
+				return
+			}
+			conn.WriteInt64(length)
+		case "rpush":
+			if len(cmd.Args) < 3 {
+				conn.WriteError("ERR wrong number of arguments for 'rpush' command")
+				return
+			}
+			key := string(cmd.Args[1])
+			var values []string
+			for i := 2; i < len(cmd.Args); i++ {
+				values = append(values, string(cmd.Args[i]))
+			}
+			length, err := rs.server.RPush(key, values...)
+			if err != nil {
+				conn.WriteError(fmt.Sprintf("ERR %v", err))
+				return
+			}
+			conn.WriteInt64(length)
+		case "lpop":
+			if len(cmd.Args) != 2 {
+				conn.WriteError("ERR wrong number of arguments for 'lpop' command")
+				return
+			}
+			key := string(cmd.Args[1])
+			value, ok, err := rs.server.LPop(key)
+			if err != nil {
+				conn.WriteError(fmt.Sprintf("ERR %v", err))
+				return
+			}
+			if ok {
+				conn.WriteBulkString(value)
+			} else {
+				conn.WriteNull()
+			}
+		case "rpop":
+			if len(cmd.Args) != 2 {
+				conn.WriteError("ERR wrong number of arguments for 'rpop' command")
+				return
+			}
+			key := string(cmd.Args[1])
+			value, ok, err := rs.server.RPop(key)
+			if err != nil {
+				conn.WriteError(fmt.Sprintf("ERR %v", err))
+				return
+			}
+			if ok {
+				conn.WriteBulkString(value)
+			} else {
+				conn.WriteNull()
+			}
+		case "lrange":
+			if len(cmd.Args) != 4 {
+				conn.WriteError("ERR wrong number of arguments for 'lrange' command")
+				return
+			}
+			key := string(cmd.Args[1])
+			start, err := commands.ParseInt64(string(cmd.Args[2]))
+			if err != nil {
+				conn.WriteError("ERR value is not an integer or out of range")
+				return
+			}
+			stop, err := commands.ParseInt64(string(cmd.Args[3]))
+			if err != nil {
+				conn.WriteError("ERR value is not an integer or out of range")
+				return
+			}
+			values, err := rs.server.LRange(key, int(start), int(stop))
+			if err != nil {
+				conn.WriteError(fmt.Sprintf("ERR %v", err))
+				return
+			}
+			conn.WriteArray(len(values))
+			for _, v := range values {
+				conn.WriteBulkString(v)
+			}
+		case "llen":
+			if len(cmd.Args) != 2 {
+				conn.WriteError("ERR wrong number of arguments for 'llen' command")
+				return
+			}
+			key := string(cmd.Args[1])
+			length, err := rs.server.LLen(key)
+			if err != nil {
+				conn.WriteError(fmt.Sprintf("ERR %v", err))
+				return
+			}
+			conn.WriteInt64(length)
+		case "sadd":
+			if len(cmd.Args) < 3 {
+				conn.WriteError("ERR wrong number of arguments for 'sadd' command")
+				return
+			}
+			key := string(cmd.Args[1])
+			var members []string
+			for i := 2; i < len(cmd.Args); i++ {
+				members = append(members, string(cmd.Args[i]))
+			}
+			added, err := rs.server.SAdd(key, members...)
+			if err != nil {
+				conn.WriteError(fmt.Sprintf("ERR %v", err))
+				return
+			}
+			conn.WriteInt64(added)
+		case "srem":
+			if len(cmd.Args) < 3 {
+				conn.WriteError("ERR wrong number of arguments for 'srem' command")
+				return
+			}
+			key := string(cmd.Args[1])
+			var members []string
+			for i := 2; i < len(cmd.Args); i++ {
+				members = append(members, string(cmd.Args[i]))
+			}
+			removed, err := rs.server.SRem(key, members...)
+			if err != nil {
+				conn.WriteError(fmt.Sprintf("ERR %v", err))
+				return
+			}
+			conn.WriteInt64(removed)
+		case "smembers":
+			if len(cmd.Args) != 2 {
+				conn.WriteError("ERR wrong number of arguments for 'smembers' command")
+				return
+			}
+			key := string(cmd.Args[1])
+			members, err := rs.server.SMembers(key)
+			if err != nil {
+				conn.WriteError(fmt.Sprintf("ERR %v", err))
+				return
+			}
+			conn.WriteArray(len(members))
+			for _, member := range members {
+				conn.WriteBulkString(member)
+			}
+		case "scard":
+			if len(cmd.Args) != 2 {
+				conn.WriteError("ERR wrong number of arguments for 'scard' command")
+				return
+			}
+			key := string(cmd.Args[1])
+			cardinality, err := rs.server.SCard(key)
+			if err != nil {
+				conn.WriteError(fmt.Sprintf("ERR %v", err))
+				return
+			}
+			conn.WriteInt64(cardinality)
+		case "sismember":
+			if len(cmd.Args) != 3 {
+				conn.WriteError("ERR wrong number of arguments for 'sismember' command")
+				return
+			}
+			key := string(cmd.Args[1])
+			member := string(cmd.Args[2])
+			exists, err := rs.server.SIsMember(key, member)
+			if err != nil {
+				conn.WriteError(fmt.Sprintf("ERR %v", err))
+				return
+			}
+			if exists {
+				conn.WriteInt64(1)
+			} else {
+				conn.WriteInt64(0)
+			}
+		case "hset":
+			if len(cmd.Args) != 4 {
+				conn.WriteError("ERR wrong number of arguments for 'hset' command")
+				return
+			}
+			key := string(cmd.Args[1])
+			field := string(cmd.Args[2])
+			value := string(cmd.Args[3])
+			isNew, err := rs.server.HSet(key, field, value)
+			if err != nil {
+				conn.WriteError(fmt.Sprintf("ERR %v", err))
+				return
+			}
+			conn.WriteInt64(isNew)
+		case "hget":
+			if len(cmd.Args) != 3 {
+				conn.WriteError("ERR wrong number of arguments for 'hget' command")
+				return
+			}
+			key := string(cmd.Args[1])
+			field := string(cmd.Args[2])
+			value, exists, err := rs.server.HGet(key, field)
+			if err != nil {
+				conn.WriteError(fmt.Sprintf("ERR %v", err))
+				return
+			}
+			if exists {
+				conn.WriteBulkString(value)
+			} else {
+				conn.WriteNull()
+			}
+		case "hdel":
+			if len(cmd.Args) < 3 {
+				conn.WriteError("ERR wrong number of arguments for 'hdel' command")
+				return
+			}
+			key := string(cmd.Args[1])
+			var fields []string
+			for i := 2; i < len(cmd.Args); i++ {
+				fields = append(fields, string(cmd.Args[i]))
+			}
+			deleted, err := rs.server.HDel(key, fields...)
+			if err != nil {
+				conn.WriteError(fmt.Sprintf("ERR %v", err))
+				return
+			}
+			conn.WriteInt64(deleted)
+		case "hgetall":
+			if len(cmd.Args) != 2 {
+				conn.WriteError("ERR wrong number of arguments for 'hgetall' command")
+				return
+			}
+			key := string(cmd.Args[1])
+			fields, err := rs.server.HGetAll(key)
+			if err != nil {
+				conn.WriteError(fmt.Sprintf("ERR %v", err))
+				return
+			}
+			conn.WriteArray(len(fields) * 2)
+			for field, value := range fields {
+				conn.WriteBulkString(field)
+				conn.WriteBulkString(value)
+			}
+		case "hlen":
+			if len(cmd.Args) != 2 {
+				conn.WriteError("ERR wrong number of arguments for 'hlen' command")
+				return
+			}
+			key := string(cmd.Args[1])
+			length, err := rs.server.HLen(key)
+			if err != nil {
+				conn.WriteError(fmt.Sprintf("ERR %v", err))
+				return
+			}
+			conn.WriteInt64(length)
+		case "zadd":
+			if len(cmd.Args) < 4 || len(cmd.Args)%2 != 0 {
+				conn.WriteError("ERR wrong number of arguments for 'zadd' command")
+				return
+			}
+			key := string(cmd.Args[1])
+
+			// Parse score-member pairs
+			memberScores := make(map[string]float64)
+			for i := 2; i < len(cmd.Args); i += 2 {
+				scoreStr := string(cmd.Args[i])
+				member := string(cmd.Args[i+1])
+
+				score, err := strconv.ParseFloat(scoreStr, 64)
+				if err != nil {
+					conn.WriteError(fmt.Sprintf("ERR value is not a valid float: %s", scoreStr))
+					return
+				}
+				memberScores[member] = score
+			}
+
+			added, err := rs.server.ZAdd(key, memberScores)
+			if err != nil {
+				conn.WriteError(fmt.Sprintf("ERR %v", err))
+				return
+			}
+			conn.WriteInt64(int64(added))
+		case "zrem":
+			if len(cmd.Args) < 3 {
+				conn.WriteError("ERR wrong number of arguments for 'zrem' command")
+				return
+			}
+			key := string(cmd.Args[1])
+			members := make([]string, len(cmd.Args)-2)
+			for i := 2; i < len(cmd.Args); i++ {
+				members[i-2] = string(cmd.Args[i])
+			}
+
+			removed, err := rs.server.ZRem(key, members)
+			if err != nil {
+				conn.WriteError(fmt.Sprintf("ERR %v", err))
+				return
+			}
+			conn.WriteInt64(int64(removed))
+		case "zscore":
+			if len(cmd.Args) != 3 {
+				conn.WriteError("ERR wrong number of arguments for 'zscore' command")
+				return
+			}
+			key := string(cmd.Args[1])
+			member := string(cmd.Args[2])
+
+			score, exists, err := rs.server.ZScore(key, member)
+			if err != nil {
+				conn.WriteError(fmt.Sprintf("ERR %v", err))
+				return
+			}
+			if !exists {
+				conn.WriteNull()
+			} else {
+				conn.WriteBulkString(fmt.Sprintf("%.17g", *score))
+			}
+		case "zcard":
+			if len(cmd.Args) != 2 {
+				conn.WriteError("ERR wrong number of arguments for 'zcard' command")
+				return
+			}
+			key := string(cmd.Args[1])
+
+			count, err := rs.server.ZCard(key)
+			if err != nil {
+				conn.WriteError(fmt.Sprintf("ERR %v", err))
+				return
+			}
+			conn.WriteInt64(int64(count))
+		case "zrange":
+			if len(cmd.Args) < 4 {
+				conn.WriteError("ERR wrong number of arguments for 'zrange' command")
+				return
+			}
+			key := string(cmd.Args[1])
+
+			// Parse arguments
+			args := make([]string, len(cmd.Args)-2)
+			for i := 2; i < len(cmd.Args); i++ {
+				args[i-2] = string(cmd.Args[i])
+			}
+
+			start, stop, withScores, err := storage.ParseZRangeArgs(args)
+			if err != nil {
+				conn.WriteError(fmt.Sprintf("ERR %v", err))
+				return
+			}
+
+			members, scores, err := rs.server.ZRange(key, start, stop, withScores)
+			if err != nil {
+				conn.WriteError(fmt.Sprintf("ERR %v", err))
+				return
+			}
+
+			if withScores {
+				conn.WriteArray(len(members) * 2)
+				for i, member := range members {
+					conn.WriteBulkString(member)
+					conn.WriteBulkString(fmt.Sprintf("%.17g", scores[i]))
+				}
+			} else {
+				conn.WriteArray(len(members))
+				for _, member := range members {
+					conn.WriteBulkString(member)
+				}
+			}
+		case "zrangebyscore":
+			if len(cmd.Args) < 4 {
+				conn.WriteError("ERR wrong number of arguments for 'zrangebyscore' command")
+				return
+			}
+			key := string(cmd.Args[1])
+
+			// Parse arguments
+			args := make([]string, len(cmd.Args)-2)
+			for i := 2; i < len(cmd.Args); i++ {
+				args[i-2] = string(cmd.Args[i])
+			}
+
+			min, max, withScores, err := storage.ParseZRangeByScoreArgs(args)
+			if err != nil {
+				conn.WriteError(fmt.Sprintf("ERR %v", err))
+				return
+			}
+
+			members, scores, err := rs.server.ZRangeByScore(key, min, max, withScores)
+			if err != nil {
+				conn.WriteError(fmt.Sprintf("ERR %v", err))
+				return
+			}
+
+			if withScores {
+				conn.WriteArray(len(members) * 2)
+				for i, member := range members {
+					conn.WriteBulkString(member)
+					conn.WriteBulkString(fmt.Sprintf("%.17g", scores[i]))
+				}
+			} else {
+				conn.WriteArray(len(members))
+				for _, member := range members {
+					conn.WriteBulkString(member)
+				}
+			}
+		case "zrank":
+			if len(cmd.Args) != 3 {
+				conn.WriteError("ERR wrong number of arguments for 'zrank' command")
+				return
+			}
+			key := string(cmd.Args[1])
+			member := string(cmd.Args[2])
+
+			rank, exists, err := rs.server.ZRank(key, member)
+			if err != nil {
+				conn.WriteError(fmt.Sprintf("ERR %v", err))
+				return
+			}
+			if !exists {
+				conn.WriteNull()
+			} else {
+				conn.WriteInt64(int64(*rank))
+			}
+		default:
+			conn.WriteError("ERR unknown command")
+		}
 	}
 }
 
