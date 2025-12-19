@@ -86,36 +86,22 @@ Step 11: Persistence Optimization Implementation - Done
 - Created extensive test suite covering segment operations, rotation, compaction, and edge cases.
 - Optimized for write-heavy workloads with minimal impact on read performance.
 
-## Implementation Complete!
-
-All major CRDT Redis server features have been implemented:
-
-✅ **Core CRDT Data Types**: Strings (LWW), Counters (Accumulative), Lists, Sets (Observed-Remove), Hashes (LWW per field), Sorted Sets (Observed-Remove with scores)
-
-✅ **Advanced Features**: Vector clocks for causality tracking, optimized persistence with append-only segments, comprehensive configuration system
-
-✅ **Redis Compatibility**: Full Redis protocol support for all implemented data types with proper command handling
-
-✅ **Replication**: Operation-based replication with conflict-free merge semantics and peer synchronization
-
-✅ **Production Ready**: Extensive test coverage, performance benchmarks, configuration management, and monitoring
-
 Step 12: Final Testing and Bug Fixes - Done
 - Fixed TestIntegrationMultiServer timeout by properly implementing HTTP-based replication with syncers.
 - Fixed TestPersistenceOptimization Redis context cancellation by implementing NullRedisClient for Redis-free mode.
 - Added comprehensive error handling and graceful degradation when Redis is unavailable.
 - Achieved 100% test success rate: All 28 tests now pass (1 skipped test by design).
 
-## 🏆 FINAL ACHIEVEMENT: 100% TEST SUCCESS RATE!
+## CRDB Revamp (2025 Updates)
 
-**Test Summary**: 28 tests run, 28 passed, 0 failed
-**Success Rate**: 100%
-**Core Functionality**: ✅ Fully operational and production ready
+Step 13: Revamp & Stabilization (Phase 0) - Done
+- Analyzed codebase gaps: Incorrect timestamp propagation, List CRDT is append-only (not RGA), lack of GC.
+- Created `.cursor/rules/crdt-standards.mdc` to enforce TDD and Correctness.
+- Updated `docs/plan.md` and `docs/spec.md` with new architectural goals.
+- Fixed failing `TestServerInterServerSync` by correctly initializing Syncers and HTTP servers in the test harness.
+- Established stable test baseline (all tests passing).
 
-## Potential Future Enhancements
-- Additional Redis data types (HyperLogLog, Streams, Bitmaps)
-- Advanced replication topologies (mesh, hierarchical)
-- Clustering and sharding support
-- Monitoring and observability improvements
-- Performance optimizations for specific workloads
-
+Next Steps:
+- Fix replication timestamp propagation (Unit test -> Refactor Store -> Update Server).
+- Re-implement CRDTList using RGA.
+- Implement Tombstone Garbage Collection.

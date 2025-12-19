@@ -1,0 +1,39 @@
+---
+description: Standards for developing the Active-Active Redis CRDB, emphasizing TDD, correctness, and CRDT principles.
+globs: ["**/*.go", "**/*.proto"]
+---
+
+# CRDT Redis Development Standards
+
+This project implements an Active-Active Redis CRDB (Conflict-free Replicated Database). Correctness, consistency, and robustness are paramount.
+
+## 1. Test-Driven Development (TDD)
+*   **Mandatory Tests:** No new feature or bug fix is complete without a corresponding unit or integration test.
+*   **Reproduce First:** Before fixing a bug, write a failing test that reproduces the issue.
+*   **Concurrent & Distributed Scenarios:** Tests must cover concurrent modifications, out-of-order delivery, and multi-replica synchronization.
+*   **Run Tests:** run `go test ./...` frequently to ensure no regressions.
+
+## 2. Replication Correctness
+*   **Preserve Timestamps:** 
+    *   **NEVER** generate a new timestamp (e.g., `time.Now()`) when applying an operation received from a peer.
+    *   **ALWAYS** use the `Timestamp` and `ReplicaID` provided in the `Operation` proto message.
+    *   `Store` methods MUST accept optional `Timestamp` and `ReplicaID` arguments (or an `Options` struct) to distinguish between local user writes (new timestamp) and remote replication writes (preserve timestamp).
+*   **Idempotency:** Applying the same operation multiple times MUST NOT change the state or result in incorrect duplicates.
+
+## 3. CRDT Integrity
+*   **Convergence:** All replicas receiving the same set of updates (in any order) MUST converge to the exact same state.
+*   **Merge Logic:**
+    *   **LWW (Last-Write-Wins):** Use `Timestamp` > `ReplicaID` (tie-breaker) for LWW registers.
+    *   **Sets (OR-Set):** Add-wins or Observed-Remove semantics. Unique element IDs are required to handle concurrent add/delete of the same value.
+    *   **Lists (RGA):** Use Replicated Growable Array (RGA) logic. Merging MUST respect the relative ordering of elements based on their origin anchors, not just append.
+    *   **Counters:** Use PN-Counters (Positive-Negative) or similar commutative structures.
+*   **Immutability of History:** Do not rewrite operation history unless implementing compaction/GC that is proven safe.
+
+## 4. Robustness & Maintenance
+*   **Garbage Collection:** Tombstones (deleted elements) must be cleaned up eventually. Implement GC based on stable vector clocks or safe time thresholds.
+*   **Error Handling:** Fail gracefully. Network partitions or peer failures should not crash the server.
+*   **Logging:** Log significant state changes and conflicts for debugging.
+
+## 5. Coding Style
+*   **Go Idioms:** Follow standard Go conventions (Checking errors, `defer` for cleanup, Context propagation).
+*   **Comments:** Explain *why* a complex CRDT merge logic exists, not just *what* it does.
