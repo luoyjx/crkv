@@ -197,3 +197,85 @@ func (s *Store) HExists(key, field string) (bool, error) {
 
 	return hash.Exists(field), nil
 }
+
+// HIncrBy increments a hash field's counter value by delta using accumulative semantics
+func (s *Store) HIncrBy(key, field string, delta int64) (int64, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	timestamp := time.Now().UnixNano()
+	var hash *CRDTHash
+
+	if val, exists := s.items[key]; exists && val.Type == TypeHash {
+		hash = val.Hash()
+		if hash == nil {
+			return 0, fmt.Errorf("invalid hash data")
+		}
+	} else {
+		// Create new hash
+		newVal := NewHashValue(timestamp, "")
+		hash = newVal.Hash()
+		s.items[key] = newVal
+	}
+
+	// Increment the field
+	newValue, err := hash.IncrBy(field, delta, timestamp, "")
+	if err != nil {
+		return 0, err
+	}
+
+	// Update the value
+	s.items[key].SetHash(hash, timestamp)
+
+	// Update Redis
+	if err := s.redis.Set(s.ctx, key, s.items[key], nil); err != nil {
+		return newValue, fmt.Errorf("failed to write to Redis: %v", err)
+	}
+
+	if err := s.save(); err != nil {
+		return newValue, fmt.Errorf("failed to save to disk: %v", err)
+	}
+
+	return newValue, nil
+}
+
+// HIncrByFloat increments a hash field's value by a float delta
+func (s *Store) HIncrByFloat(key, field string, delta float64) (float64, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	timestamp := time.Now().UnixNano()
+	var hash *CRDTHash
+
+	if val, exists := s.items[key]; exists && val.Type == TypeHash {
+		hash = val.Hash()
+		if hash == nil {
+			return 0, fmt.Errorf("invalid hash data")
+		}
+	} else {
+		// Create new hash
+		newVal := NewHashValue(timestamp, "")
+		hash = newVal.Hash()
+		s.items[key] = newVal
+	}
+
+	// Increment the field
+	newValue, err := hash.IncrByFloat(field, delta, timestamp, "")
+	if err != nil {
+		return 0, err
+	}
+
+	// Update the value
+	s.items[key].SetHash(hash, timestamp)
+
+	// Update Redis
+	if err := s.redis.Set(s.ctx, key, s.items[key], nil); err != nil {
+		return newValue, fmt.Errorf("failed to write to Redis: %v", err)
+	}
+
+	if err := s.save(); err != nil {
+		return newValue, fmt.Errorf("failed to save to disk: %v", err)
+	}
+
+	return newValue, nil
+}

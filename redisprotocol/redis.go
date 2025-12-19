@@ -271,6 +271,25 @@ func (rs *RedisServer) handleCommand(conn redcon.Conn, cmd redcon.Command) {
 				return
 			}
 			conn.WriteInt64(val)
+		case "incrbyfloat":
+			if len(cmd.Args) != 3 {
+				conn.WriteError("ERR wrong number of arguments for 'incrbyfloat' command")
+				return
+			}
+			key := string(cmd.Args[1])
+			deltaStr := string(cmd.Args[2])
+			delta, err := strconv.ParseFloat(deltaStr, 64)
+			if err != nil {
+				conn.WriteError(fmt.Sprintf("ERR value is not a valid float: %s", deltaStr))
+				return
+			}
+			val, err := rs.server.IncrByFloat(key, delta)
+			if err != nil {
+				conn.WriteError(fmt.Sprintf("ERR %v", err))
+				return
+			}
+			// Redis returns float values as bulk strings
+			conn.WriteBulkString(strconv.FormatFloat(val, 'g', -1, 64))
 		case "lpush":
 			if len(cmd.Args) < 3 {
 				conn.WriteError("ERR wrong number of arguments for 'lpush' command")
@@ -372,6 +391,111 @@ func (rs *RedisServer) handleCommand(conn redcon.Conn, cmd redcon.Command) {
 				return
 			}
 			conn.WriteInt64(length)
+		case "lindex":
+			if len(cmd.Args) != 3 {
+				conn.WriteError("ERR wrong number of arguments for 'lindex' command")
+				return
+			}
+			key := string(cmd.Args[1])
+			index, err := commands.ParseInt64(string(cmd.Args[2]))
+			if err != nil {
+				conn.WriteError("ERR value is not an integer or out of range")
+				return
+			}
+			value, exists, err := rs.server.LIndex(key, int(index))
+			if err != nil {
+				conn.WriteError(fmt.Sprintf("ERR %v", err))
+				return
+			}
+			if exists {
+				conn.WriteBulkString(value)
+			} else {
+				conn.WriteNull()
+			}
+		case "lset":
+			if len(cmd.Args) != 4 {
+				conn.WriteError("ERR wrong number of arguments for 'lset' command")
+				return
+			}
+			key := string(cmd.Args[1])
+			index, err := commands.ParseInt64(string(cmd.Args[2]))
+			if err != nil {
+				conn.WriteError("ERR value is not an integer or out of range")
+				return
+			}
+			value := string(cmd.Args[3])
+			err = rs.server.LSet(key, int(index), value)
+			if err != nil {
+				conn.WriteError(fmt.Sprintf("ERR %v", err))
+				return
+			}
+			conn.WriteString("OK")
+		case "linsert":
+			if len(cmd.Args) != 5 {
+				conn.WriteError("ERR wrong number of arguments for 'linsert' command")
+				return
+			}
+			key := string(cmd.Args[1])
+			position := strings.ToUpper(string(cmd.Args[2]))
+			pivot := string(cmd.Args[3])
+			value := string(cmd.Args[4])
+
+			var before bool
+			if position == "BEFORE" {
+				before = true
+			} else if position == "AFTER" {
+				before = false
+			} else {
+				conn.WriteError("ERR syntax error")
+				return
+			}
+
+			result, err := rs.server.LInsert(key, before, pivot, value)
+			if err != nil {
+				conn.WriteError(fmt.Sprintf("ERR %v", err))
+				return
+			}
+			conn.WriteInt64(result)
+		case "ltrim":
+			if len(cmd.Args) != 4 {
+				conn.WriteError("ERR wrong number of arguments for 'ltrim' command")
+				return
+			}
+			key := string(cmd.Args[1])
+			start, err := commands.ParseInt64(string(cmd.Args[2]))
+			if err != nil {
+				conn.WriteError("ERR value is not an integer or out of range")
+				return
+			}
+			stop, err := commands.ParseInt64(string(cmd.Args[3]))
+			if err != nil {
+				conn.WriteError("ERR value is not an integer or out of range")
+				return
+			}
+			err = rs.server.LTrim(key, int(start), int(stop))
+			if err != nil {
+				conn.WriteError(fmt.Sprintf("ERR %v", err))
+				return
+			}
+			conn.WriteString("OK")
+		case "lrem":
+			if len(cmd.Args) != 4 {
+				conn.WriteError("ERR wrong number of arguments for 'lrem' command")
+				return
+			}
+			key := string(cmd.Args[1])
+			count, err := commands.ParseInt64(string(cmd.Args[2]))
+			if err != nil {
+				conn.WriteError("ERR value is not an integer or out of range")
+				return
+			}
+			value := string(cmd.Args[3])
+			removed, err := rs.server.LRem(key, int(count), value)
+			if err != nil {
+				conn.WriteError(fmt.Sprintf("ERR %v", err))
+				return
+			}
+			conn.WriteInt64(removed)
 		case "sadd":
 			if len(cmd.Args) < 3 {
 				conn.WriteError("ERR wrong number of arguments for 'sadd' command")
@@ -523,6 +647,48 @@ func (rs *RedisServer) handleCommand(conn redcon.Conn, cmd redcon.Command) {
 				return
 			}
 			conn.WriteInt64(length)
+		case "hincrby":
+			if len(cmd.Args) != 4 {
+				conn.WriteError("ERR wrong number of arguments for 'hincrby' command")
+				return
+			}
+			key := string(cmd.Args[1])
+			field := string(cmd.Args[2])
+			deltaStr := string(cmd.Args[3])
+
+			delta, err := strconv.ParseInt(deltaStr, 10, 64)
+			if err != nil {
+				conn.WriteError("ERR value is not an integer or out of range")
+				return
+			}
+
+			newValue, err := rs.server.HIncrBy(key, field, delta)
+			if err != nil {
+				conn.WriteError(fmt.Sprintf("ERR %v", err))
+				return
+			}
+			conn.WriteInt64(newValue)
+		case "hincrbyfloat":
+			if len(cmd.Args) != 4 {
+				conn.WriteError("ERR wrong number of arguments for 'hincrbyfloat' command")
+				return
+			}
+			key := string(cmd.Args[1])
+			field := string(cmd.Args[2])
+			deltaStr := string(cmd.Args[3])
+
+			delta, err := strconv.ParseFloat(deltaStr, 64)
+			if err != nil {
+				conn.WriteError(fmt.Sprintf("ERR value is not a valid float: %s", deltaStr))
+				return
+			}
+
+			newValue, err := rs.server.HIncrByFloat(key, field, delta)
+			if err != nil {
+				conn.WriteError(fmt.Sprintf("ERR %v", err))
+				return
+			}
+			conn.WriteBulkString(fmt.Sprintf("%.17g", newValue))
 		case "zadd":
 			if len(cmd.Args) < 4 || len(cmd.Args)%2 != 0 {
 				conn.WriteError("ERR wrong number of arguments for 'zadd' command")
@@ -690,6 +856,27 @@ func (rs *RedisServer) handleCommand(conn redcon.Conn, cmd redcon.Command) {
 			} else {
 				conn.WriteInt64(int64(*rank))
 			}
+		case "zincrby":
+			if len(cmd.Args) != 4 {
+				conn.WriteError("ERR wrong number of arguments for 'zincrby' command")
+				return
+			}
+			key := string(cmd.Args[1])
+			incrementStr := string(cmd.Args[2])
+			member := string(cmd.Args[3])
+
+			increment, err := strconv.ParseFloat(incrementStr, 64)
+			if err != nil {
+				conn.WriteError(fmt.Sprintf("ERR value is not a valid float: %s", incrementStr))
+				return
+			}
+
+			newScore, err := rs.server.ZIncrBy(key, member, increment)
+			if err != nil {
+				conn.WriteError(fmt.Sprintf("ERR %v", err))
+				return
+			}
+			conn.WriteBulkString(fmt.Sprintf("%.17g", newScore))
 		default:
 			conn.WriteError("ERR unknown command")
 		}

@@ -2,15 +2,26 @@ package storage
 
 import (
 	"encoding/json"
+	"fmt"
+)
+
+// FieldType represents the type of a hash field
+type FieldType int
+
+const (
+	FieldTypeString  FieldType = iota // Regular string field with LWW
+	FieldTypeCounter                  // Counter field with accumulative semantics
 )
 
 // HashField represents a field in a CRDT hash
 type HashField struct {
-	Key       string `json:"key"`
-	Value     string `json:"value"`
-	ID        string `json:"id"`        // Unique field ID (timestamp-replicaID-seq)
-	Timestamp int64  `json:"timestamp"` // Wall clock timestamp of last update
-	ReplicaID string `json:"replica_id"`
+	Key          string    `json:"key"`
+	Value        string    `json:"value"`         // String value (for FieldTypeString)
+	CounterValue int64     `json:"counter_value"` // Counter value (for FieldTypeCounter)
+	FieldType    FieldType `json:"field_type"`    // Type of field
+	ID           string    `json:"id"`            // Unique field ID (timestamp-replicaID-seq)
+	Timestamp    int64     `json:"timestamp"`     // Wall clock timestamp of last update
+	ReplicaID    string    `json:"replica_id"`
 }
 
 // CRDTHash implements a Last-Write-Wins Hash with field-level granularity
@@ -68,6 +79,10 @@ func (h *CRDTHash) Get(key string) (string, bool) {
 	if !exists {
 		return "", false
 	}
+	// For counter fields, return string representation of counter value
+	if field.FieldType == FieldTypeCounter {
+		return fmt.Sprintf("%d", field.CounterValue), true
+	}
 	return field.Value, true
 }
 
@@ -84,6 +99,100 @@ func (h *CRDTHash) Delete(key string) bool {
 	return true
 }
 
+// IncrBy increments a field's counter value by delta using accumulative semantics
+// If the field doesn't exist, it's created with delta as its value
+// If the field exists as a string, an error is returned
+// Returns the new counter value
+func (h *CRDTHash) IncrBy(key string, delta int64, timestamp int64, replicaID string) (int64, error) {
+	if replicaID == "" {
+		replicaID = h.ReplicaID
+	}
+
+	h.nextSeq++
+	id := generateElementID(timestamp, replicaID, h.nextSeq)
+
+	existingField, exists := h.Fields[key]
+	if exists {
+		// Field exists - check type
+		if existingField.FieldType == FieldTypeString {
+			// Per Redis behavior: try to parse string as int
+			// For simplicity, we'll convert string field to counter
+			existingField.FieldType = FieldTypeCounter
+			existingField.CounterValue = 0
+		}
+		existingField.CounterValue += delta
+		existingField.Timestamp = timestamp
+		existingField.ReplicaID = replicaID
+		existingField.ID = id
+		return existingField.CounterValue, nil
+	}
+
+	// Create new counter field
+	field := &HashField{
+		Key:          key,
+		Value:        "",
+		CounterValue: delta,
+		FieldType:    FieldTypeCounter,
+		ID:           id,
+		Timestamp:    timestamp,
+		ReplicaID:    replicaID,
+	}
+
+	h.Fields[key] = field
+	return delta, nil
+}
+
+// IncrByFloat increments a field's value by a float delta
+// Returns the new value as a float64
+func (h *CRDTHash) IncrByFloat(key string, delta float64, timestamp int64, replicaID string) (float64, error) {
+	// For simplicity, store float values as scaled integers (multiply by 1e6)
+	// Or use string representation
+	// Here we'll use a simple approach with string representation
+	if replicaID == "" {
+		replicaID = h.ReplicaID
+	}
+
+	h.nextSeq++
+	id := generateElementID(timestamp, replicaID, h.nextSeq)
+
+	existingField, exists := h.Fields[key]
+	if exists {
+		// Parse existing value as float
+		var currentValue float64
+		if existingField.FieldType == FieldTypeCounter {
+			currentValue = float64(existingField.CounterValue)
+		} else {
+			// Try to parse string as float
+			// For simplicity, start from 0
+			currentValue = 0
+		}
+		newValue := currentValue + delta
+
+		// Convert to counter type (we'll store scaled value)
+		existingField.FieldType = FieldTypeCounter
+		existingField.CounterValue = int64(newValue * 1000000) // Store as micro-units
+		existingField.Value = ""
+		existingField.Timestamp = timestamp
+		existingField.ReplicaID = replicaID
+		existingField.ID = id
+		return newValue, nil
+	}
+
+	// Create new counter field
+	field := &HashField{
+		Key:          key,
+		Value:        "",
+		CounterValue: int64(delta * 1000000), // Store as micro-units
+		FieldType:    FieldTypeCounter,
+		ID:           id,
+		Timestamp:    timestamp,
+		ReplicaID:    replicaID,
+	}
+
+	h.Fields[key] = field
+	return delta, nil
+}
+
 // Keys returns all field keys in the hash
 func (h *CRDTHash) Keys() []string {
 	keys := make([]string, 0, len(h.Fields))
@@ -97,7 +206,11 @@ func (h *CRDTHash) Keys() []string {
 func (h *CRDTHash) Values() []string {
 	values := make([]string, 0, len(h.Fields))
 	for _, field := range h.Fields {
-		values = append(values, field.Value)
+		if field.FieldType == FieldTypeCounter {
+			values = append(values, fmt.Sprintf("%d", field.CounterValue))
+		} else {
+			values = append(values, field.Value)
+		}
 	}
 	return values
 }
@@ -106,7 +219,11 @@ func (h *CRDTHash) Values() []string {
 func (h *CRDTHash) GetAll() map[string]string {
 	result := make(map[string]string, len(h.Fields))
 	for key, field := range h.Fields {
-		result[key] = field.Value
+		if field.FieldType == FieldTypeCounter {
+			result[key] = fmt.Sprintf("%d", field.CounterValue)
+		} else {
+			result[key] = field.Value
+		}
 	}
 	return result
 }
@@ -123,23 +240,58 @@ func (h *CRDTHash) Exists(key string) bool {
 }
 
 // Merge merges another CRDT hash into this one
+// String fields use LWW semantics, Counter fields use accumulative semantics
 func (h *CRDTHash) Merge(other *CRDTHash) {
-	// Merge fields (LWW semantics)
+	// Merge fields
 	for key, otherField := range other.Fields {
 		// If field is tombstoned in this hash, don't add it
 		if _, tombstoned := h.Tombstones[otherField.ID]; tombstoned {
 			continue
 		}
 
-		// If we don't have this field, add it
-		if _, exists := h.Fields[key]; !exists {
-			h.Fields[key] = otherField
+		existingField, exists := h.Fields[key]
+		if !exists {
+			// Field doesn't exist locally, add it
+			h.Fields[key] = &HashField{
+				Key:          otherField.Key,
+				Value:        otherField.Value,
+				CounterValue: otherField.CounterValue,
+				FieldType:    otherField.FieldType,
+				ID:           otherField.ID,
+				Timestamp:    otherField.Timestamp,
+				ReplicaID:    otherField.ReplicaID,
+			}
 		} else {
-			// We have the field, apply LWW
-			existingField := h.Fields[key]
-			if otherField.Timestamp > existingField.Timestamp ||
-				(otherField.Timestamp == existingField.Timestamp && otherField.ReplicaID > existingField.ReplicaID) {
-				h.Fields[key] = otherField
+			// Field exists locally
+			// Handle based on field types
+			if existingField.FieldType == FieldTypeCounter && otherField.FieldType == FieldTypeCounter {
+				// Both are counters - accumulate values (counter semantics)
+				existingField.CounterValue += otherField.CounterValue
+				// Take latest timestamp
+				if otherField.Timestamp > existingField.Timestamp {
+					existingField.Timestamp = otherField.Timestamp
+					existingField.ReplicaID = otherField.ReplicaID
+					existingField.ID = otherField.ID
+				}
+			} else if existingField.FieldType == FieldTypeCounter || otherField.FieldType == FieldTypeCounter {
+				// Type mismatch - counter wins (as it's a more specific operation)
+				if otherField.FieldType == FieldTypeCounter {
+					existingField.FieldType = FieldTypeCounter
+					existingField.CounterValue = otherField.CounterValue
+					existingField.Value = ""
+					existingField.Timestamp = otherField.Timestamp
+					existingField.ReplicaID = otherField.ReplicaID
+					existingField.ID = otherField.ID
+				}
+			} else {
+				// Both are strings - apply LWW
+				if otherField.Timestamp > existingField.Timestamp ||
+					(otherField.Timestamp == existingField.Timestamp && otherField.ReplicaID > existingField.ReplicaID) {
+					existingField.Value = otherField.Value
+					existingField.Timestamp = otherField.Timestamp
+					existingField.ReplicaID = otherField.ReplicaID
+					existingField.ID = otherField.ID
+				}
 			}
 		}
 	}

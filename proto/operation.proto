@@ -25,6 +25,9 @@ enum OperationType {
     HDEL = 10;
     ZADD = 11;
     ZREM = 12;
+    ZINCRBY = 13;
+    HINCRBY = 14;
+    INCRBYFLOAT = 15;
     // Add more operation types as needed
 }
 

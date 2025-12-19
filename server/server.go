@@ -190,6 +190,24 @@ func (s *Server) applyOperation(op *proto.Operation) error {
 		fields := op.Args[1:]
 		_, err := s.store.HDel(key, fields...)
 		return err
+	case proto.OperationType_HINCRBY:
+		if len(op.Args) != 3 {
+			return fmt.Errorf("invalid HINCRBY operation args: expected 3 (key, field, delta), got %d", len(op.Args))
+		}
+		key := op.Args[0]
+		field := op.Args[1]
+		delta, err := strconv.ParseInt(op.Args[2], 10, 64)
+		if err != nil {
+			// Try as float for HINCRBYFLOAT
+			deltaFloat, err := strconv.ParseFloat(op.Args[2], 64)
+			if err != nil {
+				return fmt.Errorf("invalid HINCRBY delta: %v", err)
+			}
+			_, err = s.store.HIncrByFloat(key, field, deltaFloat)
+			return err
+		}
+		_, err = s.store.HIncrBy(key, field, delta)
+		return err
 	case proto.OperationType_ZADD:
 		if len(op.Args) < 3 || len(op.Args)%2 != 1 {
 			return fmt.Errorf("invalid ZADD operation args: expected odd number >= 3, got %d", len(op.Args))
@@ -208,6 +226,29 @@ func (s *Server) applyOperation(op *proto.Operation) error {
 		key := op.Args[0]
 		members := op.Args[1:]
 		_, err := s.store.ZRem(key, members)
+		return err
+	case proto.OperationType_ZINCRBY:
+		if len(op.Args) != 3 {
+			return fmt.Errorf("invalid ZINCRBY operation args: expected 3 (key, increment, member), got %d", len(op.Args))
+		}
+		key := op.Args[0]
+		increment, err := strconv.ParseFloat(op.Args[1], 64)
+		if err != nil {
+			return fmt.Errorf("invalid ZINCRBY increment: %v", err)
+		}
+		member := op.Args[2]
+		_, err = s.store.ZIncrBy(key, member, increment)
+		return err
+	case proto.OperationType_INCRBYFLOAT:
+		if len(op.Args) < 2 {
+			return fmt.Errorf("invalid INCRBYFLOAT operation args: expected at least 2 (key, delta), got %d", len(op.Args))
+		}
+		key := op.Args[0]
+		delta, err := strconv.ParseFloat(op.Args[1], 64)
+		if err != nil {
+			return fmt.Errorf("invalid INCRBYFLOAT delta: %v", err)
+		}
+		_, err = s.store.IncrByFloat(key, delta)
 		return err
 	default:
 		return fmt.Errorf("unknown operation type: %v", op.Type)
@@ -537,6 +578,46 @@ func (s *Server) LLen(key string) (int64, error) {
 	return s.store.LLen(key)
 }
 
+// LIndex implements the LINDEX command
+func (s *Server) LIndex(key string, index int) (string, bool, error) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+
+	return s.store.LIndex(key, index)
+}
+
+// LSet implements the LSET command
+func (s *Server) LSet(key string, index int, value string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	return s.store.LSet(key, index, value)
+}
+
+// LInsert implements the LINSERT command
+func (s *Server) LInsert(key string, before bool, pivot string, value string) (int64, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	return s.store.LInsert(key, before, pivot, value)
+}
+
+// LTrim implements the LTRIM command
+func (s *Server) LTrim(key string, start, stop int) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	return s.store.LTrim(key, start, stop)
+}
+
+// LRem implements the LREM command
+func (s *Server) LRem(key string, count int, value string) (int64, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	return s.store.LRem(key, count, value)
+}
+
 // SAdd implements the SADD command
 func (s *Server) SAdd(key string, members ...string) (int64, error) {
 	s.mu.Lock()
@@ -755,6 +836,32 @@ func (s *Server) DecrBy(key string, delta int64) (int64, error) {
 	return s.IncrBy(key, -delta)
 }
 
+// IncrByFloat implements the INCRBYFLOAT command with counter accumulation semantics
+func (s *Server) IncrByFloat(key string, delta float64) (float64, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	timestamp := time.Now().UnixNano()
+	val, err := s.store.IncrByFloat(key, delta)
+	if err != nil {
+		return val, fmt.Errorf("failed to incrbyfloat: %v", err)
+	}
+
+	// Log the operation for CRDT replication (log the delta, not final value)
+	op := &proto.Operation{
+		OperationId: fmt.Sprintf("%d-%s", timestamp, key),
+		Type:        proto.OperationType_INCRBYFLOAT,
+		Command:     "INCRBYFLOAT",
+		Args:        []string{key, fmt.Sprintf("%.17g", delta)},
+		Timestamp:   timestamp,
+		ReplicaId:   s.replicaID,
+	}
+	if err := s.opLog.AddOperation(op); err != nil {
+		return 0, fmt.Errorf("failed to log operation: %v", err)
+	}
+	return val, nil
+}
+
 // Del implements the DEL command for one or more keys
 func (s *Server) Del(keys ...string) (int64, error) {
 	s.mu.Lock()
@@ -831,6 +938,60 @@ func (s *Server) HExists(key, field string) (bool, error) {
 	defer s.mu.RUnlock()
 
 	return s.store.HExists(key, field)
+}
+
+// HIncrBy implements the HINCRBY command with counter accumulation semantics
+func (s *Server) HIncrBy(key, field string, delta int64) (int64, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	timestamp := time.Now().UnixNano()
+	newValue, err := s.store.HIncrBy(key, field, delta)
+	if err != nil {
+		return 0, err
+	}
+
+	// Log the operation for replication
+	op := &proto.Operation{
+		OperationId: fmt.Sprintf("%d-%s-%s", timestamp, key, field),
+		Timestamp:   timestamp,
+		Command:     "HINCRBY",
+		Args:        []string{key, field, strconv.FormatInt(delta, 10)},
+		Type:        proto.OperationType_HINCRBY,
+		ReplicaId:   s.replicaID,
+	}
+	if err := s.opLog.AddOperation(op); err != nil {
+		return 0, fmt.Errorf("failed to log operation: %v", err)
+	}
+
+	return newValue, nil
+}
+
+// HIncrByFloat implements the HINCRBYFLOAT command
+func (s *Server) HIncrByFloat(key, field string, delta float64) (float64, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	timestamp := time.Now().UnixNano()
+	newValue, err := s.store.HIncrByFloat(key, field, delta)
+	if err != nil {
+		return 0, err
+	}
+
+	// Log the operation for replication
+	op := &proto.Operation{
+		OperationId: fmt.Sprintf("%d-%s-%s", timestamp, key, field),
+		Timestamp:   timestamp,
+		Command:     "HINCRBYFLOAT",
+		Args:        []string{key, field, fmt.Sprintf("%.17g", delta)},
+		Type:        proto.OperationType_HINCRBY, // Use same type for now
+		ReplicaId:   s.replicaID,
+	}
+	if err := s.opLog.AddOperation(op); err != nil {
+		return 0, fmt.Errorf("failed to log operation: %v", err)
+	}
+
+	return newValue, nil
 }
 
 // ZAdd implements the ZADD command
@@ -933,6 +1094,33 @@ func (s *Server) ZRank(key, member string) (*int, bool, error) {
 	defer s.mu.RUnlock()
 
 	return s.store.ZRank(key, member)
+}
+
+// ZIncrBy implements the ZINCRBY command with counter accumulation semantics
+func (s *Server) ZIncrBy(key, member string, increment float64) (float64, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	newScore, err := s.store.ZIncrBy(key, member, increment)
+	if err != nil {
+		return 0, err
+	}
+
+	// Log the operation for replication
+	timestamp := time.Now().UnixNano()
+	op := &proto.Operation{
+		OperationId: fmt.Sprintf("%d-%s-%s", timestamp, key, member),
+		Timestamp:   timestamp,
+		Command:     "ZINCRBY",
+		Args:        []string{key, fmt.Sprintf("%.17g", increment), member},
+		Type:        proto.OperationType_ZINCRBY,
+		ReplicaId:   s.replicaID,
+	}
+	if err := s.opLog.AddOperation(op); err != nil {
+		return 0, fmt.Errorf("failed to log operation: %v", err)
+	}
+
+	return newScore, nil
 }
 
 // OpLog exposes the operation log for replication components

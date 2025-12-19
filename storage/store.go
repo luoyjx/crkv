@@ -577,6 +577,164 @@ func (s *Store) LLen(key string) (int64, error) {
 	return int64(list.Len()), nil
 }
 
+// LIndex returns the element at the specified index
+func (s *Store) LIndex(key string, index int) (string, bool, error) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+
+	val, exists := s.items[key]
+	if !exists || val.Type != TypeList {
+		return "", false, nil
+	}
+
+	list := val.List()
+	if list == nil {
+		return "", false, fmt.Errorf("invalid list data")
+	}
+
+	value, ok := list.Index(index)
+	return value, ok, nil
+}
+
+// LSet sets the element at the specified index to a new value
+func (s *Store) LSet(key string, index int, value string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	val, exists := s.items[key]
+	if !exists || val.Type != TypeList {
+		return fmt.Errorf("ERR no such key")
+	}
+
+	list := val.List()
+	if list == nil {
+		return fmt.Errorf("invalid list data")
+	}
+
+	timestamp := time.Now().UnixNano()
+	if err := list.Set(index, value, timestamp, ""); err != nil {
+		return err
+	}
+
+	// Update the value
+	val.SetList(list, timestamp)
+
+	// Update Redis
+	if err := s.redis.Set(s.ctx, key, val, nil); err != nil {
+		return fmt.Errorf("failed to write to Redis: %v", err)
+	}
+
+	if err := s.save(); err != nil {
+		return fmt.Errorf("failed to save to disk: %v", err)
+	}
+
+	return nil
+}
+
+// LInsert inserts a value before or after the pivot element
+func (s *Store) LInsert(key string, before bool, pivot string, value string) (int64, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	val, exists := s.items[key]
+	if !exists || val.Type != TypeList {
+		return 0, nil // Key not found, return 0
+	}
+
+	list := val.List()
+	if list == nil {
+		return 0, fmt.Errorf("invalid list data")
+	}
+
+	timestamp := time.Now().UnixNano()
+	insertAfter := !before
+	result := list.Insert(pivot, value, insertAfter, timestamp, "")
+
+	if result == -1 {
+		return -1, nil // Pivot not found
+	}
+
+	// Update the value
+	val.SetList(list, timestamp)
+
+	// Update Redis
+	if err := s.redis.Set(s.ctx, key, val, nil); err != nil {
+		return int64(result), fmt.Errorf("failed to write to Redis: %v", err)
+	}
+
+	if err := s.save(); err != nil {
+		return int64(result), fmt.Errorf("failed to save to disk: %v", err)
+	}
+
+	return int64(result), nil
+}
+
+// LTrim trims a list to the specified range
+func (s *Store) LTrim(key string, start, stop int) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	val, exists := s.items[key]
+	if !exists || val.Type != TypeList {
+		return nil // Key not found, no error per Redis semantics
+	}
+
+	list := val.List()
+	if list == nil {
+		return fmt.Errorf("invalid list data")
+	}
+
+	timestamp := time.Now().UnixNano()
+	list.Trim(start, stop)
+
+	// Update the value
+	val.SetList(list, timestamp)
+
+	// Update Redis
+	if err := s.redis.Set(s.ctx, key, val, nil); err != nil {
+		return fmt.Errorf("failed to write to Redis: %v", err)
+	}
+
+	if err := s.save(); err != nil {
+		return fmt.Errorf("failed to save to disk: %v", err)
+	}
+
+	return nil
+}
+
+// LRem removes elements from a list by value
+func (s *Store) LRem(key string, count int, value string) (int64, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	val, exists := s.items[key]
+	if !exists || val.Type != TypeList {
+		return 0, nil // Key not found
+	}
+
+	list := val.List()
+	if list == nil {
+		return 0, fmt.Errorf("invalid list data")
+	}
+
+	timestamp := time.Now().UnixNano()
+	removed := list.Rem(count, value)
+
+	// Update the value
+	val.SetList(list, timestamp)
+
+	// Update Redis
+	if err := s.redis.Set(s.ctx, key, val, nil); err != nil {
+		return int64(removed), fmt.Errorf("failed to write to Redis: %v", err)
+	}
+
+	if err := s.save(); err != nil {
+		return int64(removed), fmt.Errorf("failed to save to disk: %v", err)
+	}
+
+	return int64(removed), nil
+}
+
 // IncrBy increments the value at key by increment using counter semantics
 func (s *Store) IncrBy(key string, increment int64) (int64, error) {
 	s.mu.Lock()
@@ -597,6 +755,46 @@ func (s *Store) IncrBy(key string, increment int64) (int64, error) {
 	}
 	counter += increment
 	newVal := NewCounterValue(counter, timestamp, "")
+	if err := s.redis.Set(s.ctx, key, newVal, nil); err != nil {
+		return counter, fmt.Errorf("failed to write to Redis: %v", err)
+	}
+	s.items[key] = newVal
+	if err := s.save(); err != nil {
+		return counter, fmt.Errorf("failed to save to disk: %v", err)
+	}
+	return counter, nil
+}
+
+// IncrByFloat increments the float value at key by increment using counter semantics
+func (s *Store) IncrByFloat(key string, increment float64) (float64, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	timestamp := time.Now().UnixNano()
+	var counter float64
+
+	if val, exists := s.items[key]; exists {
+		switch val.Type {
+		case TypeFloatCounter:
+			counter = val.FloatCounter()
+		case TypeCounter:
+			// Convert integer counter to float
+			counter = float64(val.Counter())
+		case TypeString:
+			// Try to parse string as float
+			parsed, err := strconv.ParseFloat(val.String(), 64)
+			if err != nil {
+				return 0, fmt.Errorf("value is not a valid float")
+			}
+			counter = parsed
+		default:
+			return 0, fmt.Errorf("WRONGTYPE Operation against a key holding the wrong kind of value")
+		}
+	}
+
+	counter += increment
+	newVal := NewFloatCounterValue(counter, timestamp, "")
+
 	if err := s.redis.Set(s.ctx, key, newVal, nil); err != nil {
 		return counter, fmt.Errorf("failed to write to Redis: %v", err)
 	}

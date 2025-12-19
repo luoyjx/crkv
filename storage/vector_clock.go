@@ -96,6 +96,11 @@ func (vc *VectorClock) IsConcurrent(other *VectorClock) bool {
 	return cmp == 0 && !vc.Equal(other)
 }
 
+// HappensAfterOrConcurrent returns true if this clock happens after or is concurrent with the other
+func (vc *VectorClock) HappensAfterOrConcurrent(other *VectorClock) bool {
+	return vc.HappensAfter(other) || vc.IsConcurrent(other)
+}
+
 // Equal returns true if both clocks are equal
 func (vc *VectorClock) Equal(other *VectorClock) bool {
 	if other == nil {
@@ -205,4 +210,3 @@ func (vc *VectorClock) Merge(other *VectorClock) {
 		}
 	}
 }
-

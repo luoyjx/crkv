@@ -10,9 +10,10 @@ import (
 // ZSetElement represents an element in a CRDT sorted set
 type ZSetElement struct {
 	Member    string       `json:"member"`     // The member value
-	Score     float64      `json:"score"`      // The score for sorting
+	Score     float64      `json:"score"`      // The base score (from ZADD with LWW)
+	Delta     float64      `json:"delta"`      // Accumulated delta from ZINCRBY (counter semantics)
 	ID        string       `json:"id"`         // Unique identifier for this element
-	Timestamp int64        `json:"timestamp"`  // When this element was added
+	Timestamp int64        `json:"timestamp"`  // When this element was added/updated
 	ReplicaID string       `json:"replica_id"` // Which replica added this element
 	AddedVC   *VectorClock `json:"added_vc"`   // Vector clock when added
 	RemovedVC *VectorClock `json:"removed_vc"` // Vector clock when removed (nil if not removed)
@@ -37,6 +38,11 @@ func NewCRDTZSet(replicaID string) *CRDTZSet {
 // generateTimestamp generates a unique timestamp
 func generateTimestamp() int64 {
 	return time.Now().UnixNano()
+}
+
+// EffectiveScore returns the effective score (base score + accumulated delta)
+func (e *ZSetElement) EffectiveScore() float64 {
+	return e.Score + e.Delta
 }
 
 // ZAdd adds one or more members with scores to the sorted set
@@ -94,6 +100,45 @@ func (zs *CRDTZSet) ZAdd(memberScores map[string]float64, vc *VectorClock) int {
 	return added
 }
 
+// ZIncrBy increments the score of a member by increment using counter semantics
+// If the member does not exist, it is added with the increment as its score
+// Returns the new effective score
+func (zs *CRDTZSet) ZIncrBy(member string, increment float64, vc *VectorClock) float64 {
+	timestamp := generateTimestamp()
+
+	if vc == nil {
+		vc = NewVectorClock()
+	}
+	vc.Increment(zs.ReplicaID)
+
+	existing, exists := zs.Elements[member]
+	if !exists || existing.IsRemoved {
+		// Create new element with increment as base score
+		elementID := fmt.Sprintf("%d-%s", timestamp, member)
+		zs.Elements[member] = &ZSetElement{
+			Member:    member,
+			Score:     increment, // Use increment as initial score
+			Delta:     0,         // No accumulated delta yet
+			ID:        elementID,
+			Timestamp: timestamp,
+			ReplicaID: zs.ReplicaID,
+			AddedVC:   vc.Copy(),
+			RemovedVC: nil,
+			IsRemoved: false,
+		}
+		return increment
+	}
+
+	// Element exists - accumulate the delta (counter semantics)
+	existing.Delta += increment
+	existing.Timestamp = timestamp
+	existing.AddedVC = vc.Copy()
+	existing.IsRemoved = false
+	existing.RemovedVC = nil
+
+	return existing.EffectiveScore()
+}
+
 // ZRem removes one or more members from the sorted set
 // Returns the number of elements that were removed
 func (zs *CRDTZSet) ZRem(members []string, vc *VectorClock) int {
@@ -118,10 +163,11 @@ func (zs *CRDTZSet) ZRem(members []string, vc *VectorClock) int {
 	return removed
 }
 
-// ZScore returns the score of a member, or nil if the member doesn't exist
+// ZScore returns the effective score of a member (base score + delta), or nil if the member doesn't exist
 func (zs *CRDTZSet) ZScore(member string) (*float64, bool) {
 	if element, exists := zs.Elements[member]; exists && !element.IsRemoved {
-		return &element.Score, true
+		score := element.EffectiveScore()
+		return &score, true
 	}
 	return nil, false
 }
@@ -137,7 +183,7 @@ func (zs *CRDTZSet) ZCard() int {
 	return count
 }
 
-// ZRange returns elements in the specified range, ordered by score
+// ZRange returns elements in the specified range, ordered by effective score
 // Start and stop are 0-based indices. Negative indices count from the end.
 // If withScores is true, scores are included in the result
 func (zs *CRDTZSet) ZRange(start, stop int, withScores bool) ([]string, []float64) {
@@ -149,10 +195,12 @@ func (zs *CRDTZSet) ZRange(start, stop int, withScores bool) ([]string, []float6
 		}
 	}
 
-	// Sort by score, then by member lexicographically
+	// Sort by effective score, then by member lexicographically
 	sort.Slice(elements, func(i, j int) bool {
-		if elements[i].Score != elements[j].Score {
-			return elements[i].Score < elements[j].Score
+		scoreI := elements[i].EffectiveScore()
+		scoreJ := elements[j].EffectiveScore()
+		if scoreI != scoreJ {
+			return scoreI < scoreJ
 		}
 		return elements[i].Member < elements[j].Member
 	})
@@ -182,7 +230,7 @@ func (zs *CRDTZSet) ZRange(start, stop int, withScores bool) ([]string, []float6
 		for i := start; i <= stop && i < length; i++ {
 			members = append(members, elements[i].Member)
 			if withScores {
-				scores = append(scores, elements[i].Score)
+				scores = append(scores, elements[i].EffectiveScore())
 			}
 		}
 	}
@@ -190,20 +238,23 @@ func (zs *CRDTZSet) ZRange(start, stop int, withScores bool) ([]string, []float6
 	return members, scores
 }
 
-// ZRangeByScore returns elements with scores between min and max (inclusive)
+// ZRangeByScore returns elements with effective scores between min and max (inclusive)
 func (zs *CRDTZSet) ZRangeByScore(min, max float64, withScores bool) ([]string, []float64) {
 	// Get all non-removed elements within score range
 	var elements []*ZSetElement
 	for _, element := range zs.Elements {
-		if !element.IsRemoved && element.Score >= min && element.Score <= max {
+		effectiveScore := element.EffectiveScore()
+		if !element.IsRemoved && effectiveScore >= min && effectiveScore <= max {
 			elements = append(elements, element)
 		}
 	}
 
-	// Sort by score, then by member lexicographically
+	// Sort by effective score, then by member lexicographically
 	sort.Slice(elements, func(i, j int) bool {
-		if elements[i].Score != elements[j].Score {
-			return elements[i].Score < elements[j].Score
+		scoreI := elements[i].EffectiveScore()
+		scoreJ := elements[j].EffectiveScore()
+		if scoreI != scoreJ {
+			return scoreI < scoreJ
 		}
 		return elements[i].Member < elements[j].Member
 	})
@@ -215,14 +266,14 @@ func (zs *CRDTZSet) ZRangeByScore(min, max float64, withScores bool) ([]string, 
 	for _, element := range elements {
 		members = append(members, element.Member)
 		if withScores {
-			scores = append(scores, element.Score)
+			scores = append(scores, element.EffectiveScore())
 		}
 	}
 
 	return members, scores
 }
 
-// ZRank returns the rank of a member (0-based index in sorted order)
+// ZRank returns the rank of a member (0-based index in sorted order by effective score)
 func (zs *CRDTZSet) ZRank(member string) (*int, bool) {
 	// Check if member exists
 	targetElement, exists := zs.Elements[member]
@@ -238,10 +289,12 @@ func (zs *CRDTZSet) ZRank(member string) (*int, bool) {
 		}
 	}
 
-	// Sort by score, then by member lexicographically
+	// Sort by effective score, then by member lexicographically
 	sort.Slice(elements, func(i, j int) bool {
-		if elements[i].Score != elements[j].Score {
-			return elements[i].Score < elements[j].Score
+		scoreI := elements[i].EffectiveScore()
+		scoreJ := elements[j].EffectiveScore()
+		if scoreI != scoreJ {
+			return scoreI < scoreJ
 		}
 		return elements[i].Member < elements[j].Member
 	})
@@ -257,6 +310,9 @@ func (zs *CRDTZSet) ZRank(member string) (*int, bool) {
 }
 
 // Merge merges another CRDT sorted set into this one
+// Conflict resolution follows Active-Active semantics:
+// - Set level: OR-Set (add/update wins over concurrent delete for unobserved elements)
+// - Score level: Base score uses LWW, Delta uses counter accumulation
 func (zs *CRDTZSet) Merge(other *CRDTZSet) {
 	if other == nil {
 		return
@@ -266,16 +322,20 @@ func (zs *CRDTZSet) Merge(other *CRDTZSet) {
 		existing, exists := zs.Elements[member]
 
 		if !exists {
-			// Element doesn't exist locally, add it
+			// Element doesn't exist locally, add it with both Score and Delta
 			zs.Elements[member] = &ZSetElement{
 				Member:    otherElement.Member,
 				Score:     otherElement.Score,
+				Delta:     otherElement.Delta, // Copy delta for counter semantics
 				ID:        otherElement.ID,
 				Timestamp: otherElement.Timestamp,
 				ReplicaID: otherElement.ReplicaID,
-				AddedVC:   otherElement.AddedVC.Copy(),
+				AddedVC:   nil,
 				RemovedVC: nil,
 				IsRemoved: false,
+			}
+			if otherElement.AddedVC != nil {
+				zs.Elements[member].AddedVC = otherElement.AddedVC.Copy()
 			}
 			if otherElement.RemovedVC != nil {
 				zs.Elements[member].RemovedVC = otherElement.RemovedVC.Copy()
@@ -286,34 +346,44 @@ func (zs *CRDTZSet) Merge(other *CRDTZSet) {
 			// Merge vector clocks
 			if existing.AddedVC != nil && otherElement.AddedVC != nil {
 				existing.AddedVC.Update(otherElement.AddedVC)
+			} else if otherElement.AddedVC != nil {
+				existing.AddedVC = otherElement.AddedVC.Copy()
 			}
 
-			// Handle removal
+			// Handle removal with observed-remove semantics
+			// Per doc: ZREM + concurrent ZINCRBY results in delta being preserved
 			if otherElement.RemovedVC != nil {
 				if existing.RemovedVC == nil {
 					existing.RemovedVC = otherElement.RemovedVC.Copy()
-					existing.IsRemoved = true
 				} else {
 					existing.RemovedVC.Update(otherElement.RemovedVC)
-					existing.IsRemoved = existing.IsRemoved || otherElement.IsRemoved
+				}
+				// Only mark as removed if the remove happened after the add
+				if existing.AddedVC == nil || existing.RemovedVC.HappensAfterOrConcurrent(existing.AddedVC) {
+					existing.IsRemoved = true
 				}
 			}
 
-			// Update score if the other element has a more recent add
+			// Merge scores and deltas for non-removed elements
 			if !existing.IsRemoved && !otherElement.IsRemoved {
-				shouldUpdate := false
+				// Accumulate deltas (counter semantics for ZINCRBY)
+				// This ensures concurrent ZINCRBY operations are summed
+				existing.Delta += otherElement.Delta
+
+				// Base score uses LWW (for ZADD operations)
+				shouldUpdateScore := false
 				if existing.AddedVC == nil && otherElement.AddedVC != nil {
-					shouldUpdate = true
+					shouldUpdateScore = true
 				} else if existing.AddedVC != nil && otherElement.AddedVC != nil {
 					if existing.AddedVC.HappensBefore(otherElement.AddedVC) {
-						shouldUpdate = true
+						shouldUpdateScore = true
 					} else if existing.AddedVC.IsConcurrent(otherElement.AddedVC) {
-						// For concurrent updates, use timestamp as tie-breaker
-						shouldUpdate = otherElement.Timestamp > existing.Timestamp
+						// For concurrent ZADD, use timestamp as tie-breaker
+						shouldUpdateScore = otherElement.Timestamp > existing.Timestamp
 					}
 				}
 
-				if shouldUpdate {
+				if shouldUpdateScore {
 					existing.Score = otherElement.Score
 					existing.Timestamp = otherElement.Timestamp
 					existing.ReplicaID = otherElement.ReplicaID

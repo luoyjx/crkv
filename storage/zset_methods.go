@@ -43,6 +43,45 @@ func (s *Store) ZAdd(key string, memberScores map[string]float64) (int, error) {
 	return added, nil
 }
 
+// ZIncrBy increments the score of a member by increment using counter semantics
+// If the member does not exist, it is added with increment as its score
+// Returns the new effective score
+func (s *Store) ZIncrBy(key string, member string, increment float64) (float64, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	value, exists := s.items[key]
+	var zset *CRDTZSet
+
+	if !exists {
+		// Create new sorted set
+		value = NewZSetValue("", nil)
+		s.items[key] = value
+		var err error
+		zset, err = value.GetZSet()
+		if err != nil {
+			return 0, fmt.Errorf("failed to get zset: %v", err)
+		}
+	} else {
+		if value.Type != TypeZSet {
+			return 0, fmt.Errorf("key is not a sorted set")
+		}
+		var err error
+		zset, err = value.GetZSet()
+		if err != nil {
+			return 0, fmt.Errorf("failed to get zset: %v", err)
+		}
+	}
+
+	// Increment using counter semantics
+	newScore := zset.ZIncrBy(member, increment, value.VectorClock)
+
+	// Update the value in the store
+	value.SetZSet(zset)
+
+	return newScore, nil
+}
+
 // ZRem removes one or more members from the sorted set
 func (s *Store) ZRem(key string, members []string) (int, error) {
 	s.mu.Lock()

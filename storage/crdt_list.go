@@ -261,6 +261,209 @@ func (list *CRDTList) Len() int {
 	return count
 }
 
+// Index returns the element at the specified index (LINDEX command)
+func (list *CRDTList) Index(index int) (string, bool) {
+	visible := list.VisibleElements()
+	length := len(visible)
+
+	// Handle negative index
+	if index < 0 {
+		index = length + index
+	}
+
+	// Bounds check
+	if index < 0 || index >= length {
+		return "", false
+	}
+
+	return visible[index].Value, true
+}
+
+// Set updates the element at the specified index (LSET command)
+func (list *CRDTList) Set(index int, value string, timestamp int64, replicaID string) error {
+	visible := list.VisibleElements()
+	length := len(visible)
+
+	// Handle negative index
+	if index < 0 {
+		index = length + index
+	}
+
+	// Bounds check
+	if index < 0 || index >= length {
+		return fmt.Errorf("ERR index out of range")
+	}
+
+	// Find and update the element
+	targetID := visible[index].ID
+	for i := range list.Elements {
+		if list.Elements[i].ID == targetID && !list.Elements[i].Deleted {
+			list.Elements[i].Value = value
+			list.Elements[i].Timestamp = timestamp
+			return nil
+		}
+	}
+	return fmt.Errorf("ERR element not found")
+}
+
+// Insert inserts a value before or after the pivot element (LINSERT command)
+// insertAfter: true = AFTER, false = BEFORE
+// Returns the list length after insert, or -1 if pivot not found
+func (list *CRDTList) Insert(pivot string, value string, insertAfter bool, timestamp int64, replicaID string) int {
+	visible := list.VisibleElements()
+
+	// Find pivot element
+	var pivotElem *ListElement
+	var pivotActualIndex int = -1
+	for i, elem := range visible {
+		if elem.Value == pivot {
+			// Find actual index in Elements slice
+			for j := range list.Elements {
+				if list.Elements[j].ID == elem.ID {
+					pivotElem = &list.Elements[j]
+					pivotActualIndex = j
+					break
+				}
+			}
+			_ = i // pivot index in visible (not used currently)
+			break
+		}
+	}
+
+	if pivotElem == nil || pivotActualIndex == -1 {
+		return -1 // Pivot not found
+	}
+
+	// Create new element
+	elementID := generateElementID(timestamp, replicaID, list.NextSeq)
+	list.NextSeq++
+
+	newElem := ListElement{
+		Value:     value,
+		ID:        elementID,
+		Timestamp: timestamp,
+		ReplicaID: replicaID,
+		Deleted:   false,
+	}
+
+	// Calculate insert position
+	insertPos := pivotActualIndex
+	if insertAfter {
+		insertPos++
+	}
+
+	// Insert into slice
+	if insertPos >= len(list.Elements) {
+		list.Elements = append(list.Elements, newElem)
+	} else {
+		list.Elements = append(list.Elements[:insertPos+1], list.Elements[insertPos:]...)
+		list.Elements[insertPos] = newElem
+	}
+
+	return list.Len()
+}
+
+// Trim trims the list to the specified range (LTRIM command)
+func (list *CRDTList) Trim(start, stop int) {
+	visible := list.VisibleElements()
+	length := len(visible)
+
+	if length == 0 {
+		return
+	}
+
+	// Handle negative indices
+	if start < 0 {
+		start = length + start
+	}
+	if stop < 0 {
+		stop = length + stop
+	}
+
+	// Bounds adjustment
+	if start < 0 {
+		start = 0
+	}
+	if stop >= length {
+		stop = length - 1
+	}
+
+	// If start > stop, delete all
+	if start > stop {
+		for i := range list.Elements {
+			if !list.Elements[i].Deleted {
+				list.Elements[i].Deleted = true
+			}
+		}
+		return
+	}
+
+	// Build set of IDs to keep
+	keepIDs := make(map[string]bool)
+	for i := start; i <= stop && i < length; i++ {
+		keepIDs[visible[i].ID] = true
+	}
+
+	// Mark elements outside range as deleted
+	for i := range list.Elements {
+		if !list.Elements[i].Deleted && !keepIDs[list.Elements[i].ID] {
+			list.Elements[i].Deleted = true
+		}
+	}
+}
+
+// Rem removes elements by value (LREM command)
+// count > 0: Remove first count occurrences from head to tail
+// count < 0: Remove first |count| occurrences from tail to head
+// count = 0: Remove all occurrences
+// Returns the number of removed elements
+func (list *CRDTList) Rem(count int, value string) int {
+	visible := list.VisibleElements()
+	removed := 0
+
+	// Determine direction and max removals
+	fromHead := count >= 0
+	maxRemove := count
+	if count < 0 {
+		maxRemove = -count
+	}
+	if count == 0 {
+		maxRemove = len(visible) // Remove all
+	}
+
+	// Find elements to remove
+	var toRemove []string
+	if fromHead {
+		for _, elem := range visible {
+			if elem.Value == value && len(toRemove) < maxRemove {
+				toRemove = append(toRemove, elem.ID)
+			}
+		}
+	} else {
+		// From tail
+		for i := len(visible) - 1; i >= 0 && len(toRemove) < maxRemove; i-- {
+			if visible[i].Value == value {
+				toRemove = append(toRemove, visible[i].ID)
+			}
+		}
+	}
+
+	// Mark as deleted
+	removeSet := make(map[string]bool)
+	for _, id := range toRemove {
+		removeSet[id] = true
+	}
+
+	for i := range list.Elements {
+		if removeSet[list.Elements[i].ID] && !list.Elements[i].Deleted {
+			list.Elements[i].Deleted = true
+			removed++
+		}
+	}
+
+	return removed
+}
+
 // Merge merges another CRDTList into this one (for replication)
 func (list *CRDTList) Merge(other *CRDTList) {
 	// Create a map of existing element IDs for fast lookup

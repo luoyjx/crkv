@@ -3,6 +3,7 @@ package storage
 import (
 	"encoding/binary"
 	"fmt"
+	"math"
 	"strconv"
 	"time"
 )
@@ -11,12 +12,13 @@ import (
 type ValueType int
 
 const (
-	TypeString  ValueType = iota // Regular string with LWW
-	TypeCounter                  // String counter with accumulative semantics
-	TypeList                     // List with CRDT semantics
-	TypeSet                      // Set with CRDT semantics
-	TypeHash                     // Hash with CRDT semantics
-	TypeZSet                     // Sorted Set with CRDT semantics
+	TypeString       ValueType = iota // Regular string with LWW
+	TypeCounter                       // String counter with accumulative semantics (int64)
+	TypeFloatCounter                  // Float counter with accumulative semantics (float64)
+	TypeList                          // List with CRDT semantics
+	TypeSet                           // Set with CRDT semantics
+	TypeHash                          // Hash with CRDT semantics
+	TypeZSet                          // Sorted Set with CRDT semantics
 )
 
 // Value represents a stored value with CRDT metadata
@@ -58,6 +60,25 @@ func NewCounterValue(counter int64, timestamp int64, replicaID string) *Value {
 	}
 }
 
+// NewFloatCounterValue creates a new Value for float counters
+func NewFloatCounterValue(counter float64, timestamp int64, replicaID string) *Value {
+	vc := NewVectorClock()
+	if replicaID != "" {
+		vc.Increment(replicaID)
+	}
+	// Store float64 as IEEE 754 binary representation
+	data := make([]byte, 8)
+	bits := math.Float64bits(counter)
+	binary.BigEndian.PutUint64(data, bits)
+	return &Value{
+		Type:        TypeFloatCounter,
+		Data:        data,
+		Timestamp:   timestamp,
+		ReplicaID:   replicaID,
+		VectorClock: vc,
+	}
+}
+
 // String returns the string representation of the value
 func (v *Value) String() string {
 	switch v.Type {
@@ -66,6 +87,9 @@ func (v *Value) String() string {
 	case TypeCounter:
 		counter := v.Counter()
 		return strconv.FormatInt(counter, 10)
+	case TypeFloatCounter:
+		counter := v.FloatCounter()
+		return strconv.FormatFloat(counter, 'g', -1, 64)
 	case TypeList:
 		list := v.List()
 		if list == nil {
@@ -112,6 +136,27 @@ func (v *Value) SetCounter(counter int64) {
 		v.Data = make([]byte, 8)
 	}
 	binary.BigEndian.PutUint64(v.Data, uint64(counter))
+}
+
+// FloatCounter returns the float counter value if type is TypeFloatCounter
+func (v *Value) FloatCounter() float64 {
+	if v.Type != TypeFloatCounter || len(v.Data) != 8 {
+		return 0
+	}
+	bits := binary.BigEndian.Uint64(v.Data)
+	return math.Float64frombits(bits)
+}
+
+// SetFloatCounter sets the float counter value and updates the internal bytes
+func (v *Value) SetFloatCounter(counter float64) {
+	if v.Type != TypeFloatCounter {
+		return
+	}
+	if len(v.Data) != 8 {
+		v.Data = make([]byte, 8)
+	}
+	bits := math.Float64bits(counter)
+	binary.BigEndian.PutUint64(v.Data, bits)
 }
 
 func (v *Value) SetExpireAt(expireAt *time.Time) {
@@ -179,6 +224,14 @@ func (v *Value) Merge(other *Value) {
 		// Accumulate counter values
 		newCounter := v.Counter() + other.Counter()
 		v.SetCounter(newCounter)
+		// Take the latest timestamp
+		if other.Timestamp > v.Timestamp {
+			v.Timestamp = other.Timestamp
+		}
+	case TypeFloatCounter:
+		// Accumulate float counter values (same semantics as integer counter)
+		newCounter := v.FloatCounter() + other.FloatCounter()
+		v.SetFloatCounter(newCounter)
 		// Take the latest timestamp
 		if other.Timestamp > v.Timestamp {
 			v.Timestamp = other.Timestamp
