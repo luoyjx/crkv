@@ -113,5 +113,12 @@ Step 15: Fix List CRDT (Phase 2) - Done
 - Updated `Merge` to reconstruct the list based on RGA rules (deterministic sorting of siblings).
 - Verified `TestListMergeRGAInterleaving` passes, confirming convergence.
 
+Step 16: Garbage Collection (Phase 3) - Done
+- Refactored `CRDTSet` and `CRDTHash` to store deletion timestamps in `Tombstones`.
+- Refactored `CRDTList` and `CRDTZSet` to track `DeletedAt`/`RemovedAt` for elements.
+- Implemented `GC(cutoff int64)` methods for all CRDTs to purge old tombstones.
+- Added `TombstoneTTL` and `gcLoop` to `Store` for periodic garbage collection.
+- Added comprehensive unit and integration tests (`storage/crdt_gc_test.go`) verifying GC behavior.
+
 Next Steps:
-- Implement Tombstone Garbage Collection (Phase 3).
+- Chaos Testing (Phase 4).
