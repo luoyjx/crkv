@@ -15,6 +15,7 @@ type ListElement struct {
 	ReplicaID    string `json:"replica_id"`
 	OriginLeftID string `json:"origin_left_id"` // ID of the element to the left at insertion time
 	Deleted      bool   `json:"deleted"`        // For tombstone-based deletion
+	DeletedAt    int64  `json:"deleted_at"`     // Timestamp when deleted (for GC)
 }
 
 // CRDTList represents a CRDT list with observed-remove semantics
@@ -326,7 +327,7 @@ func compareIDs(a, b ListElement) int {
 }
 
 // LPop removes and returns the first element
-func (list *CRDTList) LPop() (string, bool) {
+func (list *CRDTList) LPop(timestamp int64) (string, bool) {
 	visible := list.VisibleElements()
 	if len(visible) == 0 {
 		return "", false
@@ -336,6 +337,7 @@ func (list *CRDTList) LPop() (string, bool) {
 	for i := range list.Elements {
 		if list.Elements[i].ID == visible[0].ID && !list.Elements[i].Deleted {
 			list.Elements[i].Deleted = true
+			list.Elements[i].DeletedAt = timestamp
 			return visible[0].Value, true
 		}
 	}
@@ -343,7 +345,7 @@ func (list *CRDTList) LPop() (string, bool) {
 }
 
 // RPop removes and returns the last element
-func (list *CRDTList) RPop() (string, bool) {
+func (list *CRDTList) RPop(timestamp int64) (string, bool) {
 	visible := list.VisibleElements()
 	if len(visible) == 0 {
 		return "", false
@@ -354,6 +356,7 @@ func (list *CRDTList) RPop() (string, bool) {
 	for i := range list.Elements {
 		if list.Elements[i].ID == lastVisible.ID && !list.Elements[i].Deleted {
 			list.Elements[i].Deleted = true
+			list.Elements[i].DeletedAt = timestamp
 			return lastVisible.Value, true
 		}
 	}
@@ -519,7 +522,7 @@ func (list *CRDTList) Insert(pivot string, value string, insertAfter bool, times
 }
 
 // Trim trims the list to the specified range (LTRIM command)
-func (list *CRDTList) Trim(start, stop int) {
+func (list *CRDTList) Trim(start, stop int, timestamp int64) {
 	visible := list.VisibleElements()
 	length := len(visible)
 
@@ -548,6 +551,7 @@ func (list *CRDTList) Trim(start, stop int) {
 		for i := range list.Elements {
 			if !list.Elements[i].Deleted {
 				list.Elements[i].Deleted = true
+				list.Elements[i].DeletedAt = timestamp
 			}
 		}
 		return
@@ -563,6 +567,7 @@ func (list *CRDTList) Trim(start, stop int) {
 	for i := range list.Elements {
 		if !list.Elements[i].Deleted && !keepIDs[list.Elements[i].ID] {
 			list.Elements[i].Deleted = true
+			list.Elements[i].DeletedAt = timestamp
 		}
 	}
 }
@@ -572,7 +577,7 @@ func (list *CRDTList) Trim(start, stop int) {
 // count < 0: Remove first |count| occurrences from tail to head
 // count = 0: Remove all occurrences
 // Returns the number of removed elements
-func (list *CRDTList) Rem(count int, value string) int {
+func (list *CRDTList) Rem(count int, value string, timestamp int64) int {
 	visible := list.VisibleElements()
 	removed := 0
 
@@ -612,6 +617,7 @@ func (list *CRDTList) Rem(count int, value string) int {
 	for i := range list.Elements {
 		if removeSet[list.Elements[i].ID] && !list.Elements[i].Deleted {
 			list.Elements[i].Deleted = true
+			list.Elements[i].DeletedAt = timestamp
 			removed++
 		}
 	}
@@ -634,6 +640,9 @@ func (list *CRDTList) Merge(other *CRDTList) {
 			// Element exists, merge deletion state (delete wins)
 			if otherElem.Deleted {
 				existingElem.Deleted = true
+				if otherElem.DeletedAt > existingElem.DeletedAt {
+					existingElem.DeletedAt = otherElem.DeletedAt
+				}
 			}
 		} else {
 			// New element, add it
@@ -651,6 +660,24 @@ func (list *CRDTList) Merge(other *CRDTList) {
 	if addedNew {
 		list.rebuildRGA()
 	}
+}
+
+// GC removes deleted elements older than cutoffTimestamp
+func (list *CRDTList) GC(cutoffTimestamp int64) int {
+	cleaned := 0
+	newElements := make([]ListElement, 0, len(list.Elements))
+	for _, elem := range list.Elements {
+		if elem.Deleted && elem.DeletedAt > 0 && elem.DeletedAt < cutoffTimestamp {
+			cleaned++
+			continue
+		}
+		newElements = append(newElements, elem)
+	}
+	list.Elements = newElements
+	// Note: Removing elements might break OriginLeftID chains for very old concurrent ops,
+	// but those ops would also likely be GC'd or are too old to matter for convergence
+	// (they will attach to head if origin is missing).
+	return cleaned
 }
 
 // generateElementID creates a unique element ID

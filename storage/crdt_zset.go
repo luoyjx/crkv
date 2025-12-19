@@ -18,6 +18,7 @@ type ZSetElement struct {
 	AddedVC   *VectorClock `json:"added_vc"`   // Vector clock when added
 	RemovedVC *VectorClock `json:"removed_vc"` // Vector clock when removed (nil if not removed)
 	IsRemoved bool         `json:"is_removed"` // Whether this element is marked as removed
+	RemovedAt int64        `json:"removed_at"` // Timestamp when removed (for GC)
 }
 
 // CRDTZSet represents a CRDT sorted set using Observed-Remove semantics
@@ -92,6 +93,7 @@ func (zs *CRDTZSet) ZAdd(memberScores map[string]float64, vc *VectorClock) int {
 					existing.AddedVC = vc.Copy()
 					existing.IsRemoved = false
 					existing.RemovedVC = nil
+					existing.RemovedAt = 0
 				}
 			}
 		}
@@ -135,13 +137,14 @@ func (zs *CRDTZSet) ZIncrBy(member string, increment float64, vc *VectorClock) f
 	existing.AddedVC = vc.Copy()
 	existing.IsRemoved = false
 	existing.RemovedVC = nil
+	existing.RemovedAt = 0
 
 	return existing.EffectiveScore()
 }
 
 // ZRem removes one or more members from the sorted set
 // Returns the number of elements that were removed
-func (zs *CRDTZSet) ZRem(members []string, vc *VectorClock) int {
+func (zs *CRDTZSet) ZRem(members []string, timestamp int64, vc *VectorClock) int {
 	removed := 0
 
 	if vc == nil {
@@ -155,6 +158,7 @@ func (zs *CRDTZSet) ZRem(members []string, vc *VectorClock) int {
 			if element.AddedVC == nil || !vc.HappensBefore(element.AddedVC) {
 				element.IsRemoved = true
 				element.RemovedVC = vc.Copy()
+				element.RemovedAt = timestamp
 				removed++
 			}
 		}
@@ -340,6 +344,7 @@ func (zs *CRDTZSet) Merge(other *CRDTZSet) {
 			if otherElement.RemovedVC != nil {
 				zs.Elements[member].RemovedVC = otherElement.RemovedVC.Copy()
 				zs.Elements[member].IsRemoved = otherElement.IsRemoved
+				zs.Elements[member].RemovedAt = otherElement.RemovedAt
 			}
 		} else {
 			// Element exists locally, merge
@@ -361,6 +366,9 @@ func (zs *CRDTZSet) Merge(other *CRDTZSet) {
 				// Only mark as removed if the remove happened after the add
 				if existing.AddedVC == nil || existing.RemovedVC.HappensAfterOrConcurrent(existing.AddedVC) {
 					existing.IsRemoved = true
+					if otherElement.RemovedAt > existing.RemovedAt {
+						existing.RemovedAt = otherElement.RemovedAt
+					}
 				}
 			}
 
@@ -391,6 +399,18 @@ func (zs *CRDTZSet) Merge(other *CRDTZSet) {
 			}
 		}
 	}
+}
+
+// GC removes deleted elements older than cutoffTimestamp
+func (zs *CRDTZSet) GC(cutoffTimestamp int64) int {
+	cleaned := 0
+	for member, elem := range zs.Elements {
+		if elem.IsRemoved && elem.RemovedAt > 0 && elem.RemovedAt < cutoffTimestamp {
+			delete(zs.Elements, member)
+			cleaned++
+		}
+	}
+	return cleaned
 }
 
 // NewZSetValue creates a new Value containing a CRDT sorted set

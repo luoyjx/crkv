@@ -22,6 +22,8 @@ type Store struct {
 	redis           *RedisStore       // Local Redis instance
 	segmentManager  *SegmentManager   // Optimized persistence with append-only logs
 	cleanupInterval time.Duration
+	TombstoneTTL    time.Duration
+	gcInterval      time.Duration
 	stopCleanup     chan struct{}
 	closed          bool // Flag to prevent multiple closes
 	ctx             context.Context
@@ -52,6 +54,8 @@ func NewStore(dataDir string, redisAddr string, redisDB int) (*Store, error) {
 		redis:           redis,
 		segmentManager:  segmentManager,
 		cleanupInterval: time.Second * 1,
+		TombstoneTTL:    time.Hour * 1, // Default 1 hour
+		gcInterval:      time.Minute * 5,
 		stopCleanup:     make(chan struct{}),
 		ctx:             ctx,
 		cancel:          cancel,
@@ -64,6 +68,7 @@ func NewStore(dataDir string, redisAddr string, redisDB int) (*Store, error) {
 
 	// Start cleanup goroutine
 	go store.cleanupLoop()
+	go store.gcLoop()
 
 	return store, nil
 }
@@ -236,6 +241,73 @@ func (s *Store) Close() error {
 	}
 
 	return nil
+}
+
+// gcLoop periodically runs garbage collection for tombstones
+func (s *Store) gcLoop() {
+	ticker := time.NewTicker(s.gcInterval)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-ticker.C:
+			s.GC()
+		case <-s.stopCleanup:
+			return
+		}
+	}
+}
+
+// GC performs garbage collection on all CRDTs
+func (s *Store) GC() {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	cutoff := time.Now().Add(-s.TombstoneTTL).UnixNano()
+	changed := false
+
+	for _, val := range s.items {
+		cleaned := 0
+		switch val.Type {
+		case TypeList:
+			if list := val.List(); list != nil {
+				cleaned = list.GC(cutoff)
+				if cleaned > 0 {
+					val.SetList(list, val.Timestamp)
+				}
+			}
+		case TypeSet:
+			if set := val.Set(); set != nil {
+				cleaned = set.GC(cutoff)
+				if cleaned > 0 {
+					val.SetSet(set, val.Timestamp)
+				}
+			}
+		case TypeHash:
+			if hash := val.Hash(); hash != nil {
+				cleaned = hash.GC(cutoff)
+				if cleaned > 0 {
+					val.SetHash(hash, val.Timestamp)
+				}
+			}
+		case TypeZSet:
+			if zset, _ := val.GetZSet(); zset != nil {
+				cleaned = zset.GC(cutoff)
+				if cleaned > 0 {
+					val.SetZSet(zset)
+				}
+			}
+		}
+		if cleaned > 0 {
+			changed = true
+		}
+	}
+
+	if changed {
+		if err := s.save(); err != nil {
+			log.Printf("Error saving after GC: %v", err)
+		}
+	}
 }
 
 // cleanupLoop periodically removes expired keys
@@ -545,13 +617,13 @@ func (s *Store) LPop(key string, opts ...OpOption) (string, bool, error) {
 		return "", false, fmt.Errorf("invalid list data")
 	}
 
-	value, ok := list.LPop()
+	timestamp := options.Timestamp
+	value, ok := list.LPop(timestamp)
 	if !ok {
 		return "", false, nil
 	}
 
 	// Update the value
-	timestamp := options.Timestamp
 	val.SetList(list, timestamp)
 
 	// Update Redis
@@ -588,13 +660,13 @@ func (s *Store) RPop(key string, opts ...OpOption) (string, bool, error) {
 		return "", false, fmt.Errorf("invalid list data")
 	}
 
-	value, ok := list.RPop()
+	timestamp := options.Timestamp
+	value, ok := list.RPop(timestamp)
 	if !ok {
 		return "", false, nil
 	}
 
 	// Update the value
-	timestamp := options.Timestamp
 	val.SetList(list, timestamp)
 
 	// Update Redis
@@ -753,7 +825,7 @@ func (s *Store) LTrim(key string, start, stop int) error {
 	}
 
 	timestamp := time.Now().UnixNano()
-	list.Trim(start, stop)
+	list.Trim(start, stop, timestamp)
 
 	// Update the value
 	val.SetList(list, timestamp)
@@ -786,7 +858,7 @@ func (s *Store) LRem(key string, count int, value string) (int64, error) {
 	}
 
 	timestamp := time.Now().UnixNano()
-	removed := list.Rem(count, value)
+	removed := list.Rem(count, value, timestamp)
 
 	// Update the value
 	val.SetList(list, timestamp)

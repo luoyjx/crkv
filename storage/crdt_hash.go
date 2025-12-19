@@ -27,7 +27,7 @@ type HashField struct {
 // CRDTHash implements a Last-Write-Wins Hash with field-level granularity
 type CRDTHash struct {
 	Fields     map[string]*HashField `json:"fields"`     // field key -> field mapping
-	Tombstones map[string]struct{}   `json:"tombstones"` // Set of IDs of deleted fields
+	Tombstones map[string]int64      `json:"tombstones"` // Set of IDs of deleted fields -> deletion timestamp
 	ReplicaID  string                `json:"replica_id"`
 	nextSeq    int64                 // Sequence number for local operations
 }
@@ -36,7 +36,7 @@ type CRDTHash struct {
 func NewCRDTHash(replicaID string) *CRDTHash {
 	return &CRDTHash{
 		Fields:     make(map[string]*HashField),
-		Tombstones: make(map[string]struct{}),
+		Tombstones: make(map[string]int64),
 		ReplicaID:  replicaID,
 		nextSeq:    0,
 	}
@@ -87,14 +87,14 @@ func (h *CRDTHash) Get(key string) (string, bool) {
 }
 
 // Delete removes a field from the hash using observed-remove semantics
-func (h *CRDTHash) Delete(key string) bool {
+func (h *CRDTHash) Delete(key string, timestamp int64) bool {
 	field, exists := h.Fields[key]
 	if !exists {
 		return false
 	}
 
 	// Add to tombstones to track removal
-	h.Tombstones[field.ID] = struct{}{}
+	h.Tombstones[field.ID] = timestamp
 	delete(h.Fields, key)
 	return true
 }
@@ -297,8 +297,14 @@ func (h *CRDTHash) Merge(other *CRDTHash) {
 	}
 
 	// Merge tombstones and remove tombstoned fields
-	for tombstoneID := range other.Tombstones {
-		h.Tombstones[tombstoneID] = struct{}{}
+	for tombstoneID, deletedAt := range other.Tombstones {
+		if existingDeletedAt, exists := h.Tombstones[tombstoneID]; exists {
+			if deletedAt > existingDeletedAt {
+				h.Tombstones[tombstoneID] = deletedAt
+			}
+		} else {
+			h.Tombstones[tombstoneID] = deletedAt
+		}
 
 		// Find and remove any field with this ID
 		for key, field := range h.Fields {
@@ -308,6 +314,18 @@ func (h *CRDTHash) Merge(other *CRDTHash) {
 			}
 		}
 	}
+}
+
+// GC removes tombstones older than cutoffTimestamp
+func (h *CRDTHash) GC(cutoffTimestamp int64) int {
+	cleaned := 0
+	for id, deletedAt := range h.Tombstones {
+		if deletedAt > 0 && deletedAt < cutoffTimestamp {
+			delete(h.Tombstones, id)
+			cleaned++
+		}
+	}
+	return cleaned
 }
 
 // ToJSON serializes the hash to JSON

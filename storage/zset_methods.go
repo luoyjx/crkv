@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"strconv"
 	"strings"
+	"time"
 )
 
 // ZAdd adds one or more members with scores to the sorted set
@@ -102,7 +103,8 @@ func (s *Store) ZRem(key string, members []string) (int, error) {
 	}
 
 	// Remove members from the sorted set
-	removed := zset.ZRem(members, value.VectorClock)
+	timestamp := time.Now().UnixNano()
+	removed := zset.ZRem(members, timestamp, value.VectorClock)
 
 	// Update the value
 	value.SetZSet(zset)

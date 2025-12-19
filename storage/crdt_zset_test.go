@@ -202,7 +202,7 @@ func TestZRemAndZIncrByConcurrent(t *testing.T) {
 	// Concurrent operations:
 	// Replica1: ZREM member1
 	time.Sleep(time.Millisecond)
-	zs1.ZRem([]string{"member1"}, vc1)
+	zs1.ZRem([]string{"member1"}, time.Now().UnixNano(), vc1)
 
 	// Replica2: ZINCRBY +2.0
 	time.Sleep(time.Millisecond)
@@ -246,7 +246,7 @@ func TestZIncrByOnRemovedElement(t *testing.T) {
 
 	// Add and then remove element
 	zs.ZAdd(map[string]float64{"member1": 10.0}, vc)
-	zs.ZRem([]string{"member1"}, vc)
+	zs.ZRem([]string{"member1"}, time.Now().UnixNano(), vc)
 
 	// Verify removal
 	_, exists := zs.ZScore("member1")

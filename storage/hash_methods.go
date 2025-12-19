@@ -84,15 +84,15 @@ func (s *Store) HDel(key string, fields ...string) (int64, error) {
 	}
 
 	var deleted int64
+	timestamp := time.Now().UnixNano()
 	for _, field := range fields {
-		if hash.Delete(field) {
+		if hash.Delete(field, timestamp) {
 			deleted++
 		}
 	}
 
 	if deleted > 0 {
 		// Update the value
-		timestamp := time.Now().UnixNano()
 		val.SetHash(hash, timestamp)
 
 		// Update Redis

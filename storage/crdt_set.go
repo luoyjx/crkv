@@ -15,7 +15,7 @@ type SetElement struct {
 // CRDTSet implements an Observed-Remove Set (OR-Set)
 type CRDTSet struct {
 	Elements   map[string]*SetElement `json:"elements"`   // value -> element mapping
-	Tombstones map[string]struct{}    `json:"tombstones"` // Set of IDs of removed elements
+	Tombstones map[string]int64       `json:"tombstones"` // Set of IDs of removed elements -> deletion timestamp
 	ReplicaID  string                 `json:"replica_id"`
 	nextSeq    int64                  // Sequence number for local operations
 }
@@ -24,7 +24,7 @@ type CRDTSet struct {
 func NewCRDTSet(replicaID string) *CRDTSet {
 	return &CRDTSet{
 		Elements:   make(map[string]*SetElement),
-		Tombstones: make(map[string]struct{}),
+		Tombstones: make(map[string]int64),
 		ReplicaID:  replicaID,
 		nextSeq:    0,
 	}
@@ -50,14 +50,14 @@ func (s *CRDTSet) Add(value string, timestamp int64, replicaID string) {
 }
 
 // Remove removes an element from the set using observed-remove semantics
-func (s *CRDTSet) Remove(value string) bool {
+func (s *CRDTSet) Remove(value string, timestamp int64) bool {
 	element, exists := s.Elements[value]
 	if !exists {
 		return false
 	}
 
-	// Add to tombstones to track removal
-	s.Tombstones[element.ID] = struct{}{}
+	// Add to tombstones to track removal with timestamp
+	s.Tombstones[element.ID] = timestamp
 	delete(s.Elements, value)
 	return true
 }
@@ -103,8 +103,15 @@ func (s *CRDTSet) Merge(other *CRDTSet) {
 	}
 
 	// Merge tombstones and remove tombstoned elements
-	for tombstoneID := range other.Tombstones {
-		s.Tombstones[tombstoneID] = struct{}{}
+	for tombstoneID, deletedAt := range other.Tombstones {
+		if existingDeletedAt, exists := s.Tombstones[tombstoneID]; exists {
+			// Keep the later timestamp
+			if deletedAt > existingDeletedAt {
+				s.Tombstones[tombstoneID] = deletedAt
+			}
+		} else {
+			s.Tombstones[tombstoneID] = deletedAt
+		}
 
 		// Find and remove any element with this ID
 		for value, element := range s.Elements {
@@ -114,6 +121,18 @@ func (s *CRDTSet) Merge(other *CRDTSet) {
 			}
 		}
 	}
+}
+
+// GC removes tombstones older than cutoffTimestamp
+func (s *CRDTSet) GC(cutoffTimestamp int64) int {
+	cleaned := 0
+	for id, deletedAt := range s.Tombstones {
+		if deletedAt > 0 && deletedAt < cutoffTimestamp {
+			delete(s.Tombstones, id)
+			cleaned++
+		}
+	}
+	return cleaned
 }
 
 // ToJSON serializes the set to JSON

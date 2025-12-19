@@ -65,15 +65,15 @@ func (s *Store) SRem(key string, members ...string) (int64, error) {
 	}
 
 	var removed int64
+	timestamp := time.Now().UnixNano()
 	for _, member := range members {
-		if set.Remove(member) {
+		if set.Remove(member, timestamp) {
 			removed++
 		}
 	}
 
 	if removed > 0 {
 		// Update the value
-		timestamp := time.Now().UnixNano()
 		val.SetSet(set, timestamp)
 
 		// Update Redis

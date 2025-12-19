@@ -45,13 +45,13 @@ func TestListLPopRPop(t *testing.T) {
 	list.RPush("c", timestamp+2, "replica1")
 
 	// LPOP removes from head
-	val, ok := list.LPop()
+	val, ok := list.LPop(timestamp + 3)
 	if !ok || val != "a" {
 		t.Errorf("LPOP expected 'a', got '%s'", val)
 	}
 
 	// RPOP removes from tail
-	val, ok = list.RPop()
+	val, ok = list.RPop(timestamp + 4)
 	if !ok || val != "c" {
 		t.Errorf("RPOP expected 'c', got '%s'", val)
 	}
@@ -182,7 +182,7 @@ func TestLIndexWithDeletedElements(t *testing.T) {
 	list.RPush("c", timestamp+2, "replica1")
 
 	// Delete middle element
-	list.LPop() // removes "a"
+	list.LPop(timestamp + 3) // removes "a"
 
 	// Now index 0 should be "b"
 	val, ok := list.Index(0)
@@ -389,7 +389,7 @@ func TestLTrimBasic(t *testing.T) {
 	list.RPush("d", timestamp+3, "replica1")
 
 	// Keep first 2 elements
-	list.Trim(0, 1)
+	list.Trim(0, 1, timestamp+4)
 
 	visible := list.VisibleElements()
 	if len(visible) != 2 {
@@ -410,7 +410,7 @@ func TestLTrimNegativeIndices(t *testing.T) {
 	list.RPush("d", timestamp+3, "replica1")
 
 	// Keep last 2 elements
-	list.Trim(-2, -1)
+	list.Trim(-2, -1, timestamp+4)
 
 	visible := list.VisibleElements()
 	if len(visible) != 2 {
@@ -429,7 +429,7 @@ func TestLTrimKeepAll(t *testing.T) {
 	list.RPush("b", timestamp+1, "replica1")
 
 	// Keep all elements
-	list.Trim(0, -1)
+	list.Trim(0, -1, timestamp+2)
 
 	if list.Len() != 2 {
 		t.Errorf("Expected 2 elements after trim(0,-1), got %d", list.Len())
@@ -444,7 +444,7 @@ func TestLTrimEmptyResult(t *testing.T) {
 	list.RPush("b", timestamp+1, "replica1")
 
 	// Trim beyond range
-	list.Trim(10, 20)
+	list.Trim(10, 20, timestamp+2)
 
 	if list.Len() != 0 {
 		t.Errorf("Expected 0 elements after trim(10,20), got %d", list.Len())
@@ -466,7 +466,7 @@ func TestLRemAll(t *testing.T) {
 	list.RPush("a", timestamp+4, "replica1")
 
 	// Remove all "a"
-	removed := list.Rem(0, "a")
+	removed := list.Rem(0, "a", timestamp+5)
 	if removed != 3 {
 		t.Errorf("Expected 3 removals, got %d", removed)
 	}
@@ -490,7 +490,7 @@ func TestLRemFromHead(t *testing.T) {
 	list.RPush("a", timestamp+4, "replica1")
 
 	// Remove first 2 "a" from head
-	removed := list.Rem(2, "a")
+	removed := list.Rem(2, "a", timestamp+5)
 	if removed != 2 {
 		t.Errorf("Expected 2 removals, got %d", removed)
 	}
@@ -514,7 +514,7 @@ func TestLRemFromTail(t *testing.T) {
 	list.RPush("a", timestamp+4, "replica1")
 
 	// Remove first 2 "a" from tail
-	removed := list.Rem(-2, "a")
+	removed := list.Rem(-2, "a", timestamp+5)
 	if removed != 2 {
 		t.Errorf("Expected 2 removals, got %d", removed)
 	}
@@ -534,7 +534,7 @@ func TestLRemValueNotFound(t *testing.T) {
 	list.RPush("a", timestamp, "replica1")
 	list.RPush("b", timestamp+1, "replica1")
 
-	removed := list.Rem(0, "notexist")
+	removed := list.Rem(0, "notexist", timestamp+2)
 	if removed != 0 {
 		t.Errorf("Expected 0 removals for non-existent value, got %d", removed)
 	}

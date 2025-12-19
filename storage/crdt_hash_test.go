@@ -371,7 +371,7 @@ func TestHDelCounter(t *testing.T) {
 	}
 
 	// Delete
-	deleted := h.Delete("field1")
+	deleted := h.Delete("field1", timestamp+1)
 	if !deleted {
 		t.Error("Delete should return true for existing field")
 	}
@@ -518,7 +518,7 @@ func TestTombstoneBehavior(t *testing.T) {
 	}
 
 	// h1 deletes field1
-	h1.Delete("field1")
+	h1.Delete("field1", timestamp+1)
 
 	// h2 hasn't seen the delete yet, still has field1
 	v2, exists2 := h2.Get("field1")
