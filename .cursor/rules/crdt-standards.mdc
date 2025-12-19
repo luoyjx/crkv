@@ -36,4 +36,6 @@ This project implements an Active-Active Redis CRDB (Conflict-free Replicated Da
 
 ## 5. Coding Style
 *   **Go Idioms:** Follow standard Go conventions (Checking errors, `defer` for cleanup, Context propagation).
-*   **Comments:** Explain *why* a complex CRDT merge logic exists, not just *what* it does.
+*   **Comments:** 
+    *   **Use English:** All code comments and documentation must be written in English.
+    *   **Explain Why:** Explain *why* a complex CRDT merge logic exists, not just *what* it does.

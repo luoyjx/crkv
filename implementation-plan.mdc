@@ -107,6 +107,11 @@ Step 14: Fix Replication & Timestamp Propagation (Phase 1) - Done
 - Updated `Server` to pass operation timestamps to `Store` during replication (`applyOperation`) and local execution.
 - Verified all tests pass.
 
+Step 15: Fix List CRDT (Phase 2) - Done
+- Created `TestListMergeRGAInterleaving` to reproduce concurrent insertion interleaving issues.
+- Re-implemented `CRDTList` using RGA (Replicated Growable Array) logic with `OriginLeftID`.
+- Updated `Merge` to reconstruct the list based on RGA rules (deterministic sorting of siblings).
+- Verified `TestListMergeRGAInterleaving` passes, confirming convergence.
+
 Next Steps:
-- Re-implement CRDTList using RGA (Phase 2).
 - Implement Tombstone Garbage Collection (Phase 3).

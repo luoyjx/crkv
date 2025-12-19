@@ -618,6 +618,68 @@ func TestListMergeObservedRemove(t *testing.T) {
 	}
 }
 
+func TestListMergeRGAInterleaving(t *testing.T) {
+	// Test RGA convergence for concurrent insertions at the same position
+	// Current implementation is append-only for new elements, which may fail convergence check
+	// if merge order differs.
+
+	timestamp := time.Now().UnixNano()
+
+	// Scenario: Both users insert at head (LPUSH) concurrently
+
+	// Replica 1 inserts "A"
+	list1 := &CRDTList{Elements: make([]ListElement, 0)}
+	list1.LPush("A", timestamp, "r1")
+
+	// Replica 2 inserts "B"
+	list2 := &CRDTList{Elements: make([]ListElement, 0)}
+	list2.LPush("B", timestamp, "r2") // Same timestamp
+
+	// Create clones for two-way merge
+	list1Clone := copyList(list1)
+	list2Clone := copyList(list2)
+
+	// Merge list2 into list1
+	list1.Merge(list2)
+
+	// Merge list1 into list2
+	list2Clone.Merge(list1Clone)
+
+	// Check convergence: list1 and list2Clone should be identical in order
+	vals1 := getValues(list1.VisibleElements())
+	vals2 := getValues(list2Clone.VisibleElements())
+
+	if len(vals1) != len(vals2) {
+		t.Errorf("Divergence! Lengths differ: %d vs %d", len(vals1), len(vals2))
+	}
+
+	if len(vals1) == 2 {
+		if vals1[0] != vals2[0] || vals1[1] != vals2[1] {
+			t.Errorf("Divergence! Orders differ:\nList1 merged: %v\nList2 merged: %v", vals1, vals2)
+			// Debug dump
+			t.Logf("List1 Dump:")
+			for _, e := range list1.Elements {
+				t.Logf("  Val: %s, ID: %s, Origin: '%s', TS: %d, Rep: %s", e.Value, e.ID, e.OriginLeftID, e.Timestamp, e.ReplicaID)
+			}
+			t.Logf("List2 Dump:")
+			for _, e := range list2Clone.Elements {
+				t.Logf("  Val: %s, ID: %s, Origin: '%s', TS: %d, Rep: %s", e.Value, e.ID, e.OriginLeftID, e.Timestamp, e.ReplicaID)
+			}
+		}
+	} else {
+		t.Errorf("Expected length 2, got %v and %v", vals1, vals2)
+	}
+}
+
+func copyList(l *CRDTList) *CRDTList {
+	newList := &CRDTList{
+		Elements: make([]ListElement, len(l.Elements)),
+		NextSeq:  l.NextSeq,
+	}
+	copy(newList.Elements, l.Elements)
+	return newList
+}
+
 // ============================================
 // Benchmark Tests
 // ============================================
