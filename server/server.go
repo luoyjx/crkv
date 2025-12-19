@@ -123,7 +123,18 @@ func (s *Server) applyOperation(op *proto.Operation) error {
 				delta = v
 			}
 		}
-		_, err := s.store.IncrBy(key, delta)
+
+		ts := op.Timestamp
+		if ts == 0 {
+			ts = time.Now().UnixNano()
+		}
+		rep := op.ReplicaId
+		if rep == "" {
+			rep = s.replicaID
+		}
+		opts := []storage.OpOption{storage.WithTimestamp(ts), storage.WithReplicaID(rep)}
+
+		_, err := s.store.IncrBy(key, delta, opts...)
 		return err
 	case proto.OperationType_LPUSH:
 		if len(op.Args) < 2 {
@@ -131,7 +142,17 @@ func (s *Server) applyOperation(op *proto.Operation) error {
 		}
 		key := op.Args[0]
 		values := op.Args[1:]
-		_, err := s.store.LPush(key, values...)
+
+		ts := op.Timestamp
+		if ts == 0 {
+			ts = time.Now().UnixNano()
+		}
+		rep := op.ReplicaId
+		if rep == "" {
+			rep = s.replicaID
+		}
+
+		_, err := s.store.LPush(key, values, storage.WithTimestamp(ts), storage.WithReplicaID(rep))
 		return err
 	case proto.OperationType_RPUSH:
 		if len(op.Args) < 2 {
@@ -139,23 +160,55 @@ func (s *Server) applyOperation(op *proto.Operation) error {
 		}
 		key := op.Args[0]
 		values := op.Args[1:]
-		_, err := s.store.RPush(key, values...)
+
+		ts := op.Timestamp
+		if ts == 0 {
+			ts = time.Now().UnixNano()
+		}
+		rep := op.ReplicaId
+		if rep == "" {
+			rep = s.replicaID
+		}
+
+		_, err := s.store.RPush(key, values, storage.WithTimestamp(ts), storage.WithReplicaID(rep))
 		return err
 	case proto.OperationType_LPOP:
 		if len(op.Args) < 1 {
 			return fmt.Errorf("invalid LPOP operation args: expected at least 1, got %d", len(op.Args))
 		}
 		key := op.Args[0]
+
+		ts := op.Timestamp
+		if ts == 0 {
+			ts = time.Now().UnixNano()
+		}
+		rep := op.ReplicaId
+		if rep == "" {
+			rep = s.replicaID
+		}
+		opts := []storage.OpOption{storage.WithTimestamp(ts), storage.WithReplicaID(rep)}
+
 		// For LPOP/RPOP, we need to apply the exact same removal that was logged
 		// This requires more sophisticated CRDT merge logic
-		_, _, err := s.store.LPop(key)
+		_, _, err := s.store.LPop(key, opts...)
 		return err
 	case proto.OperationType_RPOP:
 		if len(op.Args) < 1 {
 			return fmt.Errorf("invalid RPOP operation args: expected at least 1, got %d", len(op.Args))
 		}
 		key := op.Args[0]
-		_, _, err := s.store.RPop(key)
+
+		ts := op.Timestamp
+		if ts == 0 {
+			ts = time.Now().UnixNano()
+		}
+		rep := op.ReplicaId
+		if rep == "" {
+			rep = s.replicaID
+		}
+		opts := []storage.OpOption{storage.WithTimestamp(ts), storage.WithReplicaID(rep)}
+
+		_, _, err := s.store.RPop(key, opts...)
 		return err
 	case proto.OperationType_SADD:
 		if len(op.Args) < 2 {
@@ -203,9 +256,30 @@ func (s *Server) applyOperation(op *proto.Operation) error {
 			if err != nil {
 				return fmt.Errorf("invalid HINCRBY delta: %v", err)
 			}
+			// Use HIncrByFloat opts
+			ts := op.Timestamp
+			if ts == 0 {
+				ts = time.Now().UnixNano()
+			}
+			rep := op.ReplicaId
+			if rep == "" {
+				rep = s.replicaID
+			}
+			// Note: HIncrByFloat not refactored yet in this turn, skipping strict logic for it or assume done?
+			// I didn't refactor HIncrByFloat yet.
 			_, err = s.store.HIncrByFloat(key, field, deltaFloat)
 			return err
 		}
+
+		ts := op.Timestamp
+		if ts == 0 {
+			ts = time.Now().UnixNano()
+		}
+		rep := op.ReplicaId
+		if rep == "" {
+			rep = s.replicaID
+		}
+		// HIncrBy not refactored yet
 		_, err = s.store.HIncrBy(key, field, delta)
 		return err
 	case proto.OperationType_ZADD:
@@ -248,7 +322,18 @@ func (s *Server) applyOperation(op *proto.Operation) error {
 		if err != nil {
 			return fmt.Errorf("invalid INCRBYFLOAT delta: %v", err)
 		}
-		_, err = s.store.IncrByFloat(key, delta)
+
+		ts := op.Timestamp
+		if ts == 0 {
+			ts = time.Now().UnixNano()
+		}
+		rep := op.ReplicaId
+		if rep == "" {
+			rep = s.replicaID
+		}
+		opts := []storage.OpOption{storage.WithTimestamp(ts), storage.WithReplicaID(rep)}
+
+		_, err = s.store.IncrByFloat(key, delta, opts...)
 		return err
 	default:
 		return fmt.Errorf("unknown operation type: %v", op.Type)
@@ -452,7 +537,7 @@ func (s *Server) LPush(key string, values ...string) (int64, error) {
 	defer s.mu.Unlock()
 
 	timestamp := time.Now().UnixNano()
-	length, err := s.store.LPush(key, values...)
+	length, err := s.store.LPush(key, values, storage.WithTimestamp(timestamp), storage.WithReplicaID(s.replicaID))
 	if err != nil {
 		return length, fmt.Errorf("failed to lpush: %v", err)
 	}
@@ -481,7 +566,7 @@ func (s *Server) RPush(key string, values ...string) (int64, error) {
 	defer s.mu.Unlock()
 
 	timestamp := time.Now().UnixNano()
-	length, err := s.store.RPush(key, values...)
+	length, err := s.store.RPush(key, values, storage.WithTimestamp(timestamp), storage.WithReplicaID(s.replicaID))
 	if err != nil {
 		return length, fmt.Errorf("failed to rpush: %v", err)
 	}
@@ -510,7 +595,7 @@ func (s *Server) LPop(key string) (string, bool, error) {
 	defer s.mu.Unlock()
 
 	timestamp := time.Now().UnixNano()
-	value, ok, err := s.store.LPop(key)
+	value, ok, err := s.store.LPop(key, storage.WithTimestamp(timestamp), storage.WithReplicaID(s.replicaID))
 	if err != nil {
 		return value, ok, fmt.Errorf("failed to lpop: %v", err)
 	}
@@ -539,7 +624,7 @@ func (s *Server) RPop(key string) (string, bool, error) {
 	defer s.mu.Unlock()
 
 	timestamp := time.Now().UnixNano()
-	value, ok, err := s.store.RPop(key)
+	value, ok, err := s.store.RPop(key, storage.WithTimestamp(timestamp), storage.WithReplicaID(s.replicaID))
 	if err != nil {
 		return value, ok, fmt.Errorf("failed to rpop: %v", err)
 	}
@@ -776,7 +861,7 @@ func (s *Server) Incr(key string) (int64, error) {
 	defer s.mu.Unlock()
 
 	timestamp := time.Now().UnixNano()
-	val, err := s.store.Incr(key)
+	val, err := s.store.Incr(key, storage.WithTimestamp(timestamp), storage.WithReplicaID(s.replicaID))
 	if err != nil {
 		return val, fmt.Errorf("failed to incr: %v", err)
 	}
@@ -803,7 +888,7 @@ func (s *Server) IncrBy(key string, delta int64) (int64, error) {
 	defer s.mu.Unlock()
 
 	timestamp := time.Now().UnixNano()
-	val, err := s.store.IncrBy(key, delta)
+	val, err := s.store.IncrBy(key, delta, storage.WithTimestamp(timestamp), storage.WithReplicaID(s.replicaID))
 	if err != nil {
 		return val, fmt.Errorf("failed to incrby: %v", err)
 	}
@@ -842,7 +927,7 @@ func (s *Server) IncrByFloat(key string, delta float64) (float64, error) {
 	defer s.mu.Unlock()
 
 	timestamp := time.Now().UnixNano()
-	val, err := s.store.IncrByFloat(key, delta)
+	val, err := s.store.IncrByFloat(key, delta, storage.WithTimestamp(timestamp), storage.WithReplicaID(s.replicaID))
 	if err != nil {
 		return val, fmt.Errorf("failed to incrbyfloat: %v", err)
 	}

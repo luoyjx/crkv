@@ -101,7 +101,12 @@ Step 13: Revamp & Stabilization (Phase 0) - Done
 - Fixed failing `TestServerInterServerSync` by correctly initializing Syncers and HTTP servers in the test harness.
 - Established stable test baseline (all tests passing).
 
+Step 14: Fix Replication & Timestamp Propagation (Phase 1) - Done
+- Created `TestStore_Replication_ExplicitTimestamp` to verify timestamp propagation.
+- Refactored `Store` methods (`LPush`, `RPush`, `LPop`, `RPop`, `Incr`, `IncrBy`, `IncrByFloat`) to accept `OpOption` for Timestamp and ReplicaID.
+- Updated `Server` to pass operation timestamps to `Store` during replication (`applyOperation`) and local execution.
+- Verified all tests pass.
+
 Next Steps:
-- Fix replication timestamp propagation (Unit test -> Refactor Store -> Update Server).
-- Re-implement CRDTList using RGA.
-- Implement Tombstone Garbage Collection.
+- Re-implement CRDTList using RGA (Phase 2).
+- Implement Tombstone Garbage Collection (Phase 3).

@@ -339,3 +339,45 @@ func TestStore_Persistence(t *testing.T) {
 		t.Errorf("Wrong value in Redis after reopening. Expected 'value1', got '%s'", redisValue.String())
 	}
 }
+
+func TestStore_Replication_ExplicitTimestamp(t *testing.T) {
+	ts := setupTestStore(t)
+	defer ts.cleanup()
+
+	key := "list_explicit_ts"
+	val := "item1"
+	explicitTime := int64(123456789)
+	replicaID := "remote-replica"
+
+	// Call LPush with explicit timestamp and replica ID
+	_, err := ts.Store.LPush(key, []string{val}, WithTimestamp(explicitTime), WithReplicaID(replicaID))
+	if err != nil {
+		t.Fatalf("LPush failed: %v", err)
+	}
+
+	// Verify the value was stored with the explicit timestamp
+	v, exists := ts.Store.Get(key)
+	if !exists {
+		t.Fatal("Key not found")
+	}
+
+	list := v.List()
+	if list == nil {
+		t.Fatal("Value is not a list")
+	}
+
+	if list.Len() != 1 {
+		t.Fatalf("Expected list length 1, got %d", list.Len())
+	}
+
+	// Access the internal element to check timestamp
+	// Since Elements is exported, we can check directly
+	if len(list.Elements) < 1 {
+		t.Fatal("Elements empty but Len() is 1")
+	}
+
+	elem := list.Elements[0]
+	if elem.Timestamp != explicitTime {
+		t.Errorf("Expected timestamp %d, got %d", explicitTime, elem.Timestamp)
+	}
+}

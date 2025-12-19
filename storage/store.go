@@ -360,11 +360,18 @@ func (s *Store) GetTTL(key string) (int64, bool) {
 }
 
 // Incr increments the value at key by 1 using counter semantics
-func (s *Store) Incr(key string) (int64, error) {
+func (s *Store) Incr(key string, opts ...OpOption) (int64, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	timestamp := time.Now().UnixNano()
+	options := &WriteOptions{
+		Timestamp: time.Now().UnixNano(),
+	}
+	for _, opt := range opts {
+		opt(options)
+	}
+	timestamp := options.Timestamp
+
 	var counter int64
 	if val, exists := s.items[key]; exists {
 		if val.Type == TypeCounter {
@@ -378,7 +385,7 @@ func (s *Store) Incr(key string) (int64, error) {
 		}
 	}
 	counter++
-	newVal := NewCounterValue(counter, timestamp, "")
+	newVal := NewCounterValue(counter, timestamp, options.ReplicaID)
 	if err := s.redis.Set(s.ctx, key, newVal, nil); err != nil {
 		return counter, fmt.Errorf("failed to write to Redis: %v", err)
 	}
@@ -389,12 +396,52 @@ func (s *Store) Incr(key string) (int64, error) {
 	return counter, nil
 }
 
+// WriteOptions holds metadata for write operations (CRDT replication)
+type WriteOptions struct {
+	Timestamp int64
+	ReplicaID string
+	TTL       *time.Duration
+}
+
+// OpOption is a function that configures WriteOptions
+type OpOption func(*WriteOptions)
+
+// WithTimestamp sets the timestamp for the operation
+func WithTimestamp(ts int64) OpOption {
+	return func(o *WriteOptions) {
+		o.Timestamp = ts
+	}
+}
+
+// WithReplicaID sets the replica ID for the operation
+func WithReplicaID(id string) OpOption {
+	return func(o *WriteOptions) {
+		o.ReplicaID = id
+	}
+}
+
+// WithTTL sets the TTL for the operation
+func WithTTL(d time.Duration) OpOption {
+	return func(o *WriteOptions) {
+		o.TTL = &d
+	}
+}
+
 // LPush adds elements to the head of a list
-func (s *Store) LPush(key string, values ...string) (int64, error) {
+func (s *Store) LPush(key string, values []string, opts ...OpOption) (int64, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	timestamp := time.Now().UnixNano()
+	// Parse options (currently ignored to reproduce failure)
+	options := &WriteOptions{
+		Timestamp: time.Now().UnixNano(),
+	}
+	for _, opt := range opts {
+		opt(options)
+	}
+
+	// Use options
+	timestamp := options.Timestamp
 	var list *CRDTList
 
 	if val, exists := s.items[key]; exists && val.Type == TypeList {
@@ -404,14 +451,14 @@ func (s *Store) LPush(key string, values ...string) (int64, error) {
 		}
 	} else {
 		// Create new list
-		newVal := NewListValue(timestamp, "")
+		newVal := NewListValue(timestamp, options.ReplicaID)
 		list = newVal.List()
 		s.items[key] = newVal
 	}
 
 	// Add values in reverse order to maintain Redis LPUSH semantics
 	for i := len(values) - 1; i >= 0; i-- {
-		list.LPush(values[i], timestamp, "")
+		list.LPush(values[i], timestamp, options.ReplicaID)
 	}
 
 	// Update the value
@@ -430,11 +477,18 @@ func (s *Store) LPush(key string, values ...string) (int64, error) {
 }
 
 // RPush adds elements to the tail of a list
-func (s *Store) RPush(key string, values ...string) (int64, error) {
+func (s *Store) RPush(key string, values []string, opts ...OpOption) (int64, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	timestamp := time.Now().UnixNano()
+	options := &WriteOptions{
+		Timestamp: time.Now().UnixNano(),
+	}
+	for _, opt := range opts {
+		opt(options)
+	}
+
+	timestamp := options.Timestamp
 	var list *CRDTList
 
 	if val, exists := s.items[key]; exists && val.Type == TypeList {
@@ -444,14 +498,14 @@ func (s *Store) RPush(key string, values ...string) (int64, error) {
 		}
 	} else {
 		// Create new list
-		newVal := NewListValue(timestamp, "")
+		newVal := NewListValue(timestamp, options.ReplicaID)
 		list = newVal.List()
 		s.items[key] = newVal
 	}
 
 	// Add values in order
 	for _, value := range values {
-		list.RPush(value, timestamp, "")
+		list.RPush(value, timestamp, options.ReplicaID)
 	}
 
 	// Update the value
@@ -470,9 +524,16 @@ func (s *Store) RPush(key string, values ...string) (int64, error) {
 }
 
 // LPop removes and returns the first element from a list
-func (s *Store) LPop(key string) (string, bool, error) {
+func (s *Store) LPop(key string, opts ...OpOption) (string, bool, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+
+	options := &WriteOptions{
+		Timestamp: time.Now().UnixNano(),
+	}
+	for _, opt := range opts {
+		opt(options)
+	}
 
 	val, exists := s.items[key]
 	if !exists || val.Type != TypeList {
@@ -490,7 +551,7 @@ func (s *Store) LPop(key string) (string, bool, error) {
 	}
 
 	// Update the value
-	timestamp := time.Now().UnixNano()
+	timestamp := options.Timestamp
 	val.SetList(list, timestamp)
 
 	// Update Redis
@@ -506,9 +567,16 @@ func (s *Store) LPop(key string) (string, bool, error) {
 }
 
 // RPop removes and returns the last element from a list
-func (s *Store) RPop(key string) (string, bool, error) {
+func (s *Store) RPop(key string, opts ...OpOption) (string, bool, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+
+	options := &WriteOptions{
+		Timestamp: time.Now().UnixNano(),
+	}
+	for _, opt := range opts {
+		opt(options)
+	}
 
 	val, exists := s.items[key]
 	if !exists || val.Type != TypeList {
@@ -526,7 +594,7 @@ func (s *Store) RPop(key string) (string, bool, error) {
 	}
 
 	// Update the value
-	timestamp := time.Now().UnixNano()
+	timestamp := options.Timestamp
 	val.SetList(list, timestamp)
 
 	// Update Redis
@@ -736,11 +804,18 @@ func (s *Store) LRem(key string, count int, value string) (int64, error) {
 }
 
 // IncrBy increments the value at key by increment using counter semantics
-func (s *Store) IncrBy(key string, increment int64) (int64, error) {
+func (s *Store) IncrBy(key string, increment int64, opts ...OpOption) (int64, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	timestamp := time.Now().UnixNano()
+	options := &WriteOptions{
+		Timestamp: time.Now().UnixNano(),
+	}
+	for _, opt := range opts {
+		opt(options)
+	}
+	timestamp := options.Timestamp
+
 	var counter int64
 	if val, exists := s.items[key]; exists {
 		if val.Type == TypeCounter {
@@ -754,7 +829,7 @@ func (s *Store) IncrBy(key string, increment int64) (int64, error) {
 		}
 	}
 	counter += increment
-	newVal := NewCounterValue(counter, timestamp, "")
+	newVal := NewCounterValue(counter, timestamp, options.ReplicaID)
 	if err := s.redis.Set(s.ctx, key, newVal, nil); err != nil {
 		return counter, fmt.Errorf("failed to write to Redis: %v", err)
 	}
@@ -766,11 +841,18 @@ func (s *Store) IncrBy(key string, increment int64) (int64, error) {
 }
 
 // IncrByFloat increments the float value at key by increment using counter semantics
-func (s *Store) IncrByFloat(key string, increment float64) (float64, error) {
+func (s *Store) IncrByFloat(key string, increment float64, opts ...OpOption) (float64, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	timestamp := time.Now().UnixNano()
+	options := &WriteOptions{
+		Timestamp: time.Now().UnixNano(),
+	}
+	for _, opt := range opts {
+		opt(options)
+	}
+	timestamp := options.Timestamp
+
 	var counter float64
 
 	if val, exists := s.items[key]; exists {
@@ -793,7 +875,7 @@ func (s *Store) IncrByFloat(key string, increment float64) (float64, error) {
 	}
 
 	counter += increment
-	newVal := NewFloatCounterValue(counter, timestamp, "")
+	newVal := NewFloatCounterValue(counter, timestamp, options.ReplicaID)
 
 	if err := s.redis.Set(s.ctx, key, newVal, nil); err != nil {
 		return counter, fmt.Errorf("failed to write to Redis: %v", err)
