@@ -3,6 +3,8 @@ package storage
 import (
 	"encoding/json"
 	"fmt"
+	"math"
+	"strconv"
 )
 
 // FieldType represents the type of a hash field
@@ -18,6 +20,7 @@ type HashField struct {
 	Key          string    `json:"key"`
 	Value        string    `json:"value"`         // String value (for FieldTypeString)
 	CounterValue int64     `json:"counter_value"` // Counter value (for FieldTypeCounter)
+	CounterScale int64     `json:"counter_scale"` // Scale factor for counter (1 for ints, 1e6 for floats)
 	FieldType    FieldType `json:"field_type"`    // Type of field
 	ID           string    `json:"id"`            // Unique field ID (timestamp-replicaID-seq)
 	Timestamp    int64     `json:"timestamp"`     // Wall clock timestamp of last update
@@ -81,7 +84,14 @@ func (h *CRDTHash) Get(key string) (string, bool) {
 	}
 	// For counter fields, return string representation of counter value
 	if field.FieldType == FieldTypeCounter {
-		return fmt.Sprintf("%d", field.CounterValue), true
+		scale := field.CounterScale
+		if scale == 0 {
+			scale = 1
+		}
+		if scale == 1 {
+			return fmt.Sprintf("%d", field.CounterValue), true
+		}
+		return strconv.FormatFloat(float64(field.CounterValue)/float64(scale), 'f', -1, 64), true
 	}
 	return field.Value, true
 }
@@ -119,12 +129,16 @@ func (h *CRDTHash) IncrBy(key string, delta int64, timestamp int64, replicaID st
 			// For simplicity, we'll convert string field to counter
 			existingField.FieldType = FieldTypeCounter
 			existingField.CounterValue = 0
+			existingField.CounterScale = 1
 		}
-		existingField.CounterValue += delta
+		if existingField.CounterScale == 0 {
+			existingField.CounterScale = 1
+		}
+		existingField.CounterValue += delta * existingField.CounterScale
 		existingField.Timestamp = timestamp
 		existingField.ReplicaID = replicaID
 		existingField.ID = id
-		return existingField.CounterValue, nil
+		return existingField.CounterValue / existingField.CounterScale, nil
 	}
 
 	// Create new counter field
@@ -132,6 +146,7 @@ func (h *CRDTHash) IncrBy(key string, delta int64, timestamp int64, replicaID st
 		Key:          key,
 		Value:        "",
 		CounterValue: delta,
+		CounterScale: 1,
 		FieldType:    FieldTypeCounter,
 		ID:           id,
 		Timestamp:    timestamp,
@@ -160,7 +175,11 @@ func (h *CRDTHash) IncrByFloat(key string, delta float64, timestamp int64, repli
 		// Parse existing value as float
 		var currentValue float64
 		if existingField.FieldType == FieldTypeCounter {
-			currentValue = float64(existingField.CounterValue)
+			scale := existingField.CounterScale
+			if scale == 0 {
+				scale = 1
+			}
+			currentValue = float64(existingField.CounterValue) / float64(scale)
 		} else {
 			// Try to parse string as float
 			// For simplicity, start from 0
@@ -170,7 +189,9 @@ func (h *CRDTHash) IncrByFloat(key string, delta float64, timestamp int64, repli
 
 		// Convert to counter type (we'll store scaled value)
 		existingField.FieldType = FieldTypeCounter
-		existingField.CounterValue = int64(newValue * 1000000) // Store as micro-units
+		// Switch to micro-unit scale for floats
+		existingField.CounterScale = 1000000
+		existingField.CounterValue = int64(math.Round(newValue * float64(existingField.CounterScale)))
 		existingField.Value = ""
 		existingField.Timestamp = timestamp
 		existingField.ReplicaID = replicaID
@@ -182,7 +203,8 @@ func (h *CRDTHash) IncrByFloat(key string, delta float64, timestamp int64, repli
 	field := &HashField{
 		Key:          key,
 		Value:        "",
-		CounterValue: int64(delta * 1000000), // Store as micro-units
+		CounterValue: int64(math.Round(delta * 1000000)), // Store as micro-units
+		CounterScale: 1000000,
 		FieldType:    FieldTypeCounter,
 		ID:           id,
 		Timestamp:    timestamp,
@@ -207,7 +229,15 @@ func (h *CRDTHash) Values() []string {
 	values := make([]string, 0, len(h.Fields))
 	for _, field := range h.Fields {
 		if field.FieldType == FieldTypeCounter {
-			values = append(values, fmt.Sprintf("%d", field.CounterValue))
+			scale := field.CounterScale
+			if scale == 0 {
+				scale = 1
+			}
+			if scale == 1 {
+				values = append(values, fmt.Sprintf("%d", field.CounterValue))
+			} else {
+				values = append(values, strconv.FormatFloat(float64(field.CounterValue)/float64(scale), 'f', -1, 64))
+			}
 		} else {
 			values = append(values, field.Value)
 		}
@@ -220,7 +250,15 @@ func (h *CRDTHash) GetAll() map[string]string {
 	result := make(map[string]string, len(h.Fields))
 	for key, field := range h.Fields {
 		if field.FieldType == FieldTypeCounter {
-			result[key] = fmt.Sprintf("%d", field.CounterValue)
+			scale := field.CounterScale
+			if scale == 0 {
+				scale = 1
+			}
+			if scale == 1 {
+				result[key] = fmt.Sprintf("%d", field.CounterValue)
+			} else {
+				result[key] = strconv.FormatFloat(float64(field.CounterValue)/float64(scale), 'f', -1, 64)
+			}
 		} else {
 			result[key] = field.Value
 		}
@@ -256,6 +294,7 @@ func (h *CRDTHash) Merge(other *CRDTHash) {
 				Key:          otherField.Key,
 				Value:        otherField.Value,
 				CounterValue: otherField.CounterValue,
+				CounterScale: otherField.CounterScale,
 				FieldType:    otherField.FieldType,
 				ID:           otherField.ID,
 				Timestamp:    otherField.Timestamp,
@@ -266,7 +305,27 @@ func (h *CRDTHash) Merge(other *CRDTHash) {
 			// Handle based on field types
 			if existingField.FieldType == FieldTypeCounter && otherField.FieldType == FieldTypeCounter {
 				// Both are counters - accumulate values (counter semantics)
-				existingField.CounterValue += otherField.CounterValue
+				scaleA := existingField.CounterScale
+				if scaleA == 0 {
+					scaleA = 1
+				}
+				scaleB := otherField.CounterScale
+				if scaleB == 0 {
+					scaleB = 1
+				}
+
+				targetScale := scaleA
+				if scaleB > targetScale {
+					targetScale = scaleB
+				}
+
+				valueA := float64(existingField.CounterValue) / float64(scaleA)
+				valueB := float64(otherField.CounterValue) / float64(scaleB)
+				combined := valueA + valueB
+
+				existingField.CounterScale = targetScale
+				existingField.CounterValue = int64(math.Round(combined * float64(targetScale)))
+
 				// Take latest timestamp
 				if otherField.Timestamp > existingField.Timestamp {
 					existingField.Timestamp = otherField.Timestamp
@@ -278,6 +337,7 @@ func (h *CRDTHash) Merge(other *CRDTHash) {
 				if otherField.FieldType == FieldTypeCounter {
 					existingField.FieldType = FieldTypeCounter
 					existingField.CounterValue = otherField.CounterValue
+					existingField.CounterScale = otherField.CounterScale
 					existingField.Value = ""
 					existingField.Timestamp = otherField.Timestamp
 					existingField.ReplicaID = otherField.ReplicaID

@@ -183,8 +183,6 @@ func TestHIncrByFloatBasic(t *testing.T) {
 // because scaled integer storage isn't properly handled when reading existing values.
 // This test documents the expected behavior for when the bug is fixed.
 func TestHIncrByFloatAccumulation(t *testing.T) {
-	t.Skip("Skipping: HINCRBYFLOAT accumulation has a known bug in scaled integer handling")
-
 	h := NewCRDTHash("replica1")
 	timestamp := time.Now().UnixNano()
 
